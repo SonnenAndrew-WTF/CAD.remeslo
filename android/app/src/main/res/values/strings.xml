@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">remeslo.cad</string>
+    <string name="title_activity_main">remeslo.cad</string>
+    <string name="package_name">com.tabcad.app</string>
+    <string name="custom_url_scheme">com.tabcad.app</string>
+</resources>

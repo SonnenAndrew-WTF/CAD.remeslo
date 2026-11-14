@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="theme-color" content="#16181d" />
+    <title>remeslo.cad</title>
+  </head>
+  <body>
+    <div id="app">
+      <header id="topbar">
+        <button id="projects-btn" data-cmd="projects" title="Проекты">☰</button>
+        <button id="project-name" data-cmd="rename" title="Переименовать проект">Проект</button>
+        <span id="save-state"></span>
+        <span id="status">Загрузка CAD-ядра…</span>
+        <div class="spacer"></div>
+        <button data-cmd="snap" title="Привязка к сетке (G)">▦</button>
+        <button data-cmd="theme" title="Светлая / тёмная тема">☾</button>
+        <button data-cmd="undo" title="Отменить (Ctrl+Z)">↶</button>
+        <button data-cmd="redo" title="Повторить (Ctrl+Y)">↷</button>
+        <button data-cmd="fit" title="Показать всё">⤢</button>
+      </header>
+
+      <nav id="toolbar">
+        <div class="group-label">Выбор</div>
+        <div class="pick-modes">
+          <button data-cmd="pick-body" title="Выбирать тела">Тело</button>
+          <button data-cmd="pick-face" title="Выбирать грани">Грань</button>
+          <button data-cmd="pick-edge" title="Выбирать рёбра">Ребро</button>
+        </div>
+
+        <div class="group-label">Создать</div>
+        <button data-cmd="sketch"><span class="ico">✎</span>Эскиз</button>
+        <button data-cmd="plane"><span class="ico">▱</span>Плоскость</button>
+        <button data-cmd="cube"><span class="ico">▣</span>Куб</button>
+        <button data-cmd="cylinder"><span class="ico">⬭</span>Цилиндр</button>
+        <button data-cmd="sphere"><span class="ico">●</span>Сфера</button>
+
+        <div class="group-label">Булевы</div>
+        <button data-cmd="union" data-need="2"><span class="ico">∪</span>Объединить</button>
+        <button data-cmd="subtract" data-need="2"><span class="ico">∖</span>Вычесть</button>
+        <button data-cmd="intersect" data-need="2"><span class="ico">∩</span>Пересечь</button>
+
+        <div class="group-label">Правка</div>
+        <button data-cmd="multi" class="toggle"><span class="ico">⧉</span>Мультивыбор</button>
+        <button data-cmd="box" class="toggle" title="Выделение рамкой"><span class="ico">⬚</span>Рамка</button>
+        <button data-cmd="select-all" title="Выбрать все тела (Ctrl+A)"><span class="ico">☰</span>Все</button>
+        <button data-cmd="duplicate" data-need="1"><span class="ico">⎘</span>Копия</button>
+        <button data-cmd="delete" data-need="1"><span class="ico">✕</span>Удалить</button>
+
+        <div class="group-label">Файл</div>
+        <button data-cmd="import"><span class="ico">⇧</span>Импорт</button>
+        <button data-cmd="stl"><span class="ico">⇩</span>STL</button>
+        <button data-cmd="step"><span class="ico">⇩</span>STEP</button>
+        <button data-cmd="save-file"><span class="ico">⇩</span>Проект</button>
+      </nav>
+
+      <main id="viewport"></main>
+
+      <aside id="panel">
+        <section id="tree">
+          <h3>Тела</h3>
+          <ul id="body-list"></ul>
+          <h3 id="sketch-head">Эскизы</h3>
+          <ul id="sketch-list"></ul>
+          <h3 id="plane-head">Плоскости</h3>
+          <ul id="plane-list"></ul>
+        </section>
+        <section id="props"></section>
+      </aside>
+    </div>
+
+    <div id="projects" class="hidden">
+      <header>
+        <h2>Проекты</h2>
+        <div class="spacer"></div>
+        <button data-cmd="open-file">Открыть файл…</button>
+        <button data-cmd="close-projects">Закрыть</button>
+      </header>
+      <div id="project-grid"></div>
+    </div>
+    <input id="file-input" type="file" accept=".remeslo,.tabcad,.json,.step,.stp,.stl" hidden />
+
+    <div id="loader"><div class="spinner"></div><div>Загрузка CAD-ядра OpenCascade…</div></div>
+    <div id="toast"></div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

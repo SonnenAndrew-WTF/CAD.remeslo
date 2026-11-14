@@ -1,0 +1,8 @@
+{
+  "appId": "com.tabcad.app",
+  "appName": "remeslo.cad",
+  "webDir": "dist",
+  "android": {
+    "backgroundColor": "#16181d"
+  }
+}
