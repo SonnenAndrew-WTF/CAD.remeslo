@@ -5,6 +5,7 @@ import { Viewport, type Dim, type Pick, type PickMode, type ProfileRef, type Sub
 import * as K from "./kernel";
 import type { Primitive } from "./kernel";
 import * as S from "./storage";
+import { evalExpr, haptic, installNumpad, isTouchLike, uiConfirm, uiPrompt } from "./ui";
 import { Capacitor } from "@capacitor/core";
 import { Directory, Filesystem } from "@capacitor/filesystem";
 import { Share } from "@capacitor/share";
@@ -157,6 +158,23 @@ view.onTap = (pick: Pick) => {
   if (pick.kind === "face") return toggleSub(pick.id, "faces", pick.faceId);
   if (pick.kind === "edge") return toggleSub(pick.id, "edges", pick.edgeId);
   select(pick.id);
+};
+
+view.onGesture = (g) => {
+  if (!$("#projects").classList.contains("hidden") || document.querySelector(".modal")) return;
+  if (mode === "sketch") {
+    if (g === "undo") {
+      stepBack();
+      toast("↶ Шаг назад");
+    }
+    return;
+  }
+  if (mode !== "normal") return;
+  if (g === "undo" ? !doc.canUndo() : !doc.canRedo()) return toast(g === "undo" ? "Нечего отменять" : "Нечего повторять");
+  if (g === "undo") doc.undo();
+  else doc.redo();
+  haptic("confirm");
+  toast(g === "undo" ? "↶ Отменено" : "↷ Повторено");
 };
 
 view.onBoxSelect = (ids, additive) => {
@@ -444,16 +462,18 @@ function copyBodies(ids: number[]) {
   doc.replace(copies);
 }
 
-function renameBody(id: number) {
+async function renameBody(id: number) {
   const b = doc.get(id);
-  const v = b && prompt("Название тела", b.name)?.trim();
-  if (b && v && v !== b.name) doc.replace([{ ...b, name: v }]);
+  const v = b && (await uiPrompt("Название тела", b.name));
+  const cur = doc.get(id);
+  if (cur && v && v !== cur.name) doc.replace([{ ...cur, name: v }]);
 }
 
-function renameSketch(id: number) {
+async function renameSketch(id: number) {
   const sk = doc.getSketch(id);
-  const v = sk && prompt("Название эскиза", sk.name)?.trim();
-  if (sk && v && v !== sk.name) doc.change({ sketches: [{ ...sk, name: v }] });
+  const v = sk && (await uiPrompt("Название эскиза", sk.name));
+  const cur = doc.getSketch(id);
+  if (cur && v && v !== cur.name) doc.change({ sketches: [{ ...cur, name: v }] });
 }
 
 function deleteBodies(ids: number[]) {
@@ -663,6 +683,7 @@ function setTool(t: Tool) {
 
 function commitProfile(p: Profile) {
   draft!.profiles.push(p);
+  haptic("confirm");
   renderProps();
 }
 
@@ -883,7 +904,8 @@ view.onDimEdit = (id, label) => {
     target = d.profiles[i] ? dimTarget(d.profiles[i], part) : null;
   }
   if (!target) return;
-  const input = el("input", { type: "number", inputMode: "decimal", step: "any", className: "dim-input", value: fmt(target.value) });
+  const input = el("input", { type: "text", inputMode: isTouchLike() ? "none" : "decimal", autocomplete: "off", className: "dim-input", value: fmt(target.value) });
+  input.dataset.num = "";
   input.style.transform = label.style.transform;
   label.style.visibility = "hidden";
   label.parentElement!.append(input);
@@ -895,7 +917,7 @@ view.onDimEdit = (id, label) => {
     done = true;
     input.remove();
     label.style.visibility = "";
-    const v = parseFloat(input.value.replace(",", "."));
+    const v = evalExpr(input.value) ?? NaN;
     const ok = target.allowZero ? v >= 0 : v > 0;
     if (commit && ok && d.profiles[i]) d.profiles[i] = target.apply(v);
     else if (commit && !ok) toast("Размер должен быть больше нуля", true);
@@ -1000,12 +1022,18 @@ function orthoSnap(d: Draft, p: V2): V2 {
   return Math.abs(p[0] - anchor[0]) >= Math.abs(p[1] - anchor[1]) ? [p[0], anchor[1]] : [anchor[0], p[1]];
 }
 
+let lastSnapKey = "";
+
 view.onSketch = (type, p0, hot, raw, snap) => {
   const d = draft;
   if (!d) return;
   const p = orthoSnap(d, p0);
   d.cursor = p;
   d.cursorHot = hot;
+  // Отклик пером: новая точка привязки
+  const snapKey = snap ? `${snap}:${p[0]}:${p[1]}` : "";
+  if (snapKey && snapKey !== lastSnapKey) haptic("tick");
+  lastSnapKey = snapKey;
   d.snapKind = snap;
   d.hoverEnt = type === "hover" || type === "move" ? (d.drag ? null : entityUnder(d, raw)) : null;
   if (type === "cancel") {
@@ -1655,9 +1683,10 @@ function renderPlanePanel(root: HTMLElement, rp: RefPlane) {
     buttonRow(
       [
         "Переименовать",
-        () => {
-          const v = prompt("Название плоскости", rp.name)?.trim();
-          if (v) doc.change({ planes: [{ ...rp, name: v }] });
+        async () => {
+          const v = await uiPrompt("Название плоскости", rp.name);
+          const cur = doc.getPlane(rp.id);
+          if (v && cur) doc.change({ planes: [{ ...cur, name: v }] });
         },
       ],
       ["Скрыть", () => ((selPlane = null), doc.change({ planes: [{ ...rp, hidden: true }] }))],
@@ -1675,6 +1704,8 @@ const commands: Record<string, () => void> = {
   import: pickFile,
   "save-file": () => saveFile(),
   theme: () => applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"),
+  settings: () => showSettings($("[data-cmd=settings]")),
+  panel: () => setPanelCollapsed(!$("#app").classList.contains("panel-collapsed")),
   snap: () => applySnap(!view.gridSnap),
   "pick-body": () => setPickMode("body"),
   "pick-face": () => setPickMode("face"),
@@ -1768,13 +1799,19 @@ view.onMoveEnd = moveBody;
 function numberField(label: string, value: number, onCommit: (v: number) => void) {
   const row = document.createElement("div");
   row.className = "field";
-  row.innerHTML = `<label></label><input type="number" inputmode="decimal" step="any">`;
+  // Текст, а не number: можно вводить выражения «40+5», «4см»; data-num — своя клавиатура на планшете
+  row.innerHTML = `<label></label><input type="text" inputmode="decimal" data-num autocomplete="off">`;
   row.querySelector("label")!.textContent = label;
   const input = row.querySelector("input")!;
   input.value = fmt(value);
   const commit = () => {
-    const v = parseFloat(input.value.replace(",", "."));
-    if (Number.isFinite(v) && v !== value) onCommit(v);
+    const v = evalExpr(input.value);
+    if (v === null) {
+      input.value = fmt(value);
+      return toast("Не понял число — пример: 40, 40+5, 4см", true);
+    }
+    input.value = fmt(v);
+    if (v !== value) onCommit(v);
   };
   input.addEventListener("change", commit);
   input.addEventListener("keydown", (e) => e.key === "Enter" && input.blur());
@@ -2201,7 +2238,7 @@ function renderProps() {
   if (sel.length === 1 && sel[0].locked) return renderLockedPanel(root, sel[0]);
   if (sel.length === 1) return renderBodyPanel(root, sel[0]);
   if (sel.length > 1) return renderMultiPanel(root, sel);
-  root.innerHTML = `<h3>Подсказки</h3><p class="hint">${PICK_HINTS[pickMode]}<br><br>«Эскиз» — нарисовать контур на плоскости или грани, затем вытянуть его.<br><br>Один палец — вращать вид.<br>Два пальца — масштаб и сдвиг.</p>`;
+  root.innerHTML = `<h3>Подсказки</h3><p class="hint">${PICK_HINTS[pickMode]}<br><br>«Эскиз» — нарисовать контур на плоскости или грани, затем вытянуть его.<br><br>Перо — выбор и рисование.<br>Один палец — вращать вид (вокруг точки под пальцем).<br>Два пальца — масштаб и сдвиг.<br>Касание двумя пальцами — отменить, тремя — повторить.</p>`;
 }
 
 function renderLockedPanel(root: HTMLElement, b: Body) {
@@ -2426,6 +2463,7 @@ function refresh() {
   for (const m of ["body", "face", "edge"] as const) $(`[data-cmd="pick-${m}"]`).classList.toggle("on", pickMode === m);
   renderTree();
   renderProps();
+  renderCtxBar();
   document.querySelectorAll<HTMLButtonElement>("button[data-need]").forEach((btn) => {
     btn.disabled = selection.length < Number(btn.dataset.need);
   });
@@ -2455,6 +2493,168 @@ function isPlanar(bodyId: number, faceId: number): boolean {
     m.set(faceId, planar);
   }
   return m.get(faceId)!;
+}
+
+// ---------- контекстная панель у выделения ----------
+type CtxItem = [ico: string, label: string, fn: (btn: HTMLElement) => void, on?: boolean];
+const ctxBar = el("div", { className: "ctxbar" });
+$("#viewport").append(ctxBar);
+let ctxAnchor: Vec3 | null = null;
+
+/** Действия для текущего выделения — рядом с ним, чтобы не тянуться к правой панели */
+function ctxItems(): CtxItem[] {
+  if (mode !== "normal") return [];
+  const sel = selectedBodies();
+  if (sub) {
+    const e = edgeCtx();
+    if (e)
+      return [
+        ["◜", "Скругл.", () => ((edgeKind = "fillet"), refresh()), edgeKind === "fillet"],
+        ["◸", "Фаска", () => ((edgeKind = "chamfer"), refresh()), edgeKind === "chamfer"],
+        ["✓", "Применить", () => applyEdgeOp()],
+      ];
+    const f = faceCtx();
+    const items: CtxItem[] = [];
+    if (f) {
+      items.push(["⇕", "Тянуть", () => distInput?.focus()]);
+      items.push(["✎", "Эскиз", () => startSketch(K.facePlane(f.body.shape, f.faceId)!, f.body.id)]);
+    }
+    if (sub.faces.length) items.push(["◫", "Оболочка", () => applyShell()]);
+    if (f) items.push(["✓", "Применить", () => applyPushPull()]);
+    return items;
+  }
+  const ctx = extrudeCtx();
+  if (ctx) {
+    const { sk } = ctx;
+    if (!isClosed(ctx.prof)) return [["✎", "Эскиз", () => startSketch(sk.plane, sk.hostBodyId, sk)]];
+    return [
+      ["⇧", "Вытянуть", () => ((ex.op = "extrude"), refresh()), (ex.op ?? "extrude") === "extrude"],
+      ["⟳", "Вращать", () => ((ex.op = "revolve"), refresh()), ex.op === "revolve"],
+      ["✓", "Применить", () => applyExtrude()],
+      ["✎", "Эскиз", () => startSketch(sk.plane, sk.hostBodyId, sk)],
+    ];
+  }
+  const rp = selPlane !== null ? doc.getPlane(selPlane) : undefined;
+  if (rp)
+    return [
+      ["✎", "Эскиз", () => startSketch(rp.plane)],
+      ["◌", "Скрыть", () => ((selPlane = null), doc.change({ planes: [{ ...rp, hidden: true }] }))],
+      ["✕", "Удалить", () => deletePlane(rp.id)],
+    ];
+  if (sel.length > 1) {
+    const ids = sel.map((b) => b.id);
+    return [
+      ["∪", "Объед.", () => boolean("union")],
+      ["∖", "Вычесть", () => boolean("subtract")],
+      ["∩", "Пересечь", () => boolean("intersect")],
+      ["⎘", "Копия", () => copyBodies(ids)],
+      ["✕", "Удалить", () => deleteBodies(ids)],
+    ];
+  }
+  if (sel.length === 1) {
+    const b = sel[0];
+    if (b.locked) return [["🔓", "Разблок.", () => setBodyFlag([b.id], "locked", false)]];
+    const setMode = (m: typeof gizmoMode) => () => {
+      gizmoMode = m;
+      view.setGizmoMode(m);
+      refresh();
+    };
+    return [
+      ["✥", "Двигать", setMode("translate"), gizmoMode === "translate"],
+      ["⤡", "Масштаб", setMode("scale"), gizmoMode === "scale"],
+      ["⎘", "Копия", () => copyBodies([b.id])],
+      [
+        "⋯",
+        "Ещё",
+        (btn) =>
+          showMenu(btn, [
+            ["Массив…", () => showPanelSection("Массив")],
+            ["Переименовать", () => renameBody(b.id)],
+            ["Скрыть", () => setBodyFlag([b.id], "hidden", true)],
+            ["Заблокировать", () => setBodyFlag([b.id], "locked", true)],
+            ["Удалить", () => deleteBodies([b.id]), "danger"],
+          ]),
+      ],
+    ];
+  }
+  return [];
+}
+
+/** Точка в мире, у которой стоит панель: центр тела, грань, ребро, профиль или плоскость */
+function ctxAnchorPoint(): Vec3 | null {
+  if (mode !== "normal") return null;
+  if (sub) return edgeCtx()?.frame.mid ?? faceCtx()?.frame.center ?? view.centerOf(sub.bodyId) ?? null;
+  const ctx = extrudeCtx();
+  if (ctx) return toWorld(ctx.sk.plane, centroid(ctx.prof));
+  const rp = selPlane !== null ? doc.getPlane(selPlane) : undefined;
+  if (rp) return rp.plane.origin;
+  return selection.length ? (view.centerOf(selection[0]) ?? null) : null;
+}
+
+function renderCtxBar() {
+  const items = ctxItems();
+  ctxAnchor = items.length ? ctxAnchorPoint() : null;
+  ctxBar.replaceChildren(
+    ...items.map(([ico, label, fn, on]) => {
+      const b = el("button", { className: on ? "on" : "", title: label }, el("span", { className: "ico", textContent: ico }), label);
+      b.addEventListener("click", () => fn(b));
+      return b;
+    }),
+  );
+  ctxBar.style.display = ctxAnchor ? "" : "none";
+  positionCtxBar();
+}
+
+/** Каждый кадр: панель следует за выделением при вращении вида, не выходя за края */
+function positionCtxBar() {
+  if (!ctxAnchor) return;
+  const sp = view.screenOf(ctxAnchor);
+  const host = $("#viewport");
+  const w = ctxBar.offsetWidth;
+  const h = ctxBar.offsetHeight;
+  const x = Math.max(8, Math.min(sp.x - w / 2, host.clientWidth - w - 8));
+  // Над объектом; если сверху места нет — под ним
+  let y = sp.y - h - 90;
+  if (y < 8) y = Math.min(sp.y + 90, host.clientHeight - h - 8);
+  ctxBar.style.transform = `translate(${x.toFixed(0)}px, ${y.toFixed(0)}px)`;
+  ctxBar.style.visibility = sp.visible ? "" : "hidden";
+}
+view.onFrame = positionCtxBar;
+
+/** Открыть правую панель и прокрутить к разделу */
+function showPanelSection(title: string) {
+  setPanelCollapsed(false);
+  const h = [...document.querySelectorAll<HTMLElement>("#props h3")].find((x) => x.textContent === title);
+  h?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+// ---------- раскладка: левша, свёрнутая панель, полный экран ----------
+function setPanelCollapsed(on: boolean) {
+  $("#app").classList.toggle("panel-collapsed", on);
+  $("[data-cmd=panel]").classList.toggle("on", !on);
+  setPref("panel", on ? "0" : "1");
+}
+
+function setLeftHand(on: boolean) {
+  $("#app").classList.toggle("left-hand", on);
+  setPref("leftHand", on ? "1" : "0");
+}
+
+function toggleFullscreen() {
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  else document.documentElement.requestFullscreen?.().catch(() => toast("Браузер не разрешил полный экран", true));
+}
+
+function showSettings(btn: HTMLElement) {
+  const left = $("#app").classList.contains("left-hand");
+  const items: [string, () => void][] = [
+    [`Режим для левши: ${left ? "вкл" : "выкл"}`, () => setLeftHand(!left)],
+    [$("#app").classList.contains("panel-collapsed") ? "Показать панель свойств" : "Скрыть панель свойств", () => setPanelCollapsed(!$("#app").classList.contains("panel-collapsed"))],
+  ];
+  // В APK полноэкранный режим включён всегда (системные панели скрыты в MainActivity)
+  if (!Capacitor.isNativePlatform()) items.push([document.fullscreenElement ? "Выйти из полного экрана" : "Полный экран", toggleFullscreen]);
+  items.push(["Жесты: 2 пальца — отменить, 3 — повторить", () => {}]);
+  showMenu(btn, items);
 }
 
 // ---------- настройки вида: тема, привязка, проекция ----------
@@ -2495,6 +2695,9 @@ view.onProjectionChange = (p) => setPref("projection", p);
 
 const prefersDark = window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? true;
 applyTheme((getPref("theme") as Theme | null) ?? (prefersDark ? "dark" : "light"));
+setLeftHand(getPref("leftHand") === "1");
+setPanelCollapsed(getPref("panel") === "0");
+installNumpad();
 applySnap(getPref("snap") !== "0");
 if (getPref("projection") === "ortho") view.setProjection("ortho");
 
@@ -2617,8 +2820,8 @@ async function newProject(name?: string, content: Content = { bodies: [], sketch
   await saveNow();
 }
 
-function renameProject() {
-  const v = prompt("Название проекта", projectName)?.trim();
+async function renameProject() {
+  const v = await uiPrompt("Название проекта", projectName);
   if (!v || v === projectName) return;
   projectName = v;
   $("#project-name").textContent = v;
@@ -2686,10 +2889,10 @@ function closeProjects() {
 
 async function renameStored(p: S.ProjectMeta) {
   if (p.id === projectId) {
-    renameProject();
+    await renameProject();
     return showProjects();
   }
-  const v = prompt("Название проекта", p.name)?.trim();
+  const v = await uiPrompt("Название проекта", p.name);
   if (!v) return;
   await S.saveProject({ ...p, name: v });
   showProjects();
@@ -2710,7 +2913,7 @@ async function downloadProject(p: S.ProjectMeta) {
 }
 
 async function removeProject(p: S.ProjectMeta) {
-  if (!confirm(`Удалить проект «${p.name}»? Это действие нельзя отменить.`)) return;
+  if (!(await uiConfirm(`Удалить проект «${p.name}»? Это действие нельзя отменить.`, "Удалить", true))) return;
   await S.deleteProject(p.id);
   if (p.id === projectId) {
     // Текущий проект удалён — не даём автосохранению вернуть его

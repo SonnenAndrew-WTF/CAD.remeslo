@@ -12,6 +12,9 @@ import { closestOnSegment, dot, isClosed, outline, sub, toLocal, toWorld, type P
 
 const TAP_MAX_MOVE = 10; // px
 const TAP_MAX_TIME = 450; // ms
+const PALM_MS = 500; // ms — сколько после пера касания пальцем считаются ладонью
+const GESTURE_MS = 350; // ms — касание несколькими пальцами для отмены/повтора
+const GESTURE_MOVE = 14; // px — допустимое смещение пальцев в таком касании
 const SNAP_RADIUS = 16; // px — радиус прилипания к точкам эскиза
 const SNAP_STEPS = [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100];
 const EDGE_PICK_PX = 16; // px — насколько близко к ребру нужно коснуться
@@ -130,6 +133,14 @@ export class Viewport {
   scaleRule: (bodyId: number) => "free" | "xy" | "uniform" = () => "uniform";
   onDimEdit: (id: string, label: HTMLElement) => void = () => {};
   onProjectionChange: (p: Projection) => void = () => {};
+  /** Касание двумя (отмена) или тремя (повтор) пальцами */
+  onGesture: (g: "undo" | "redo") => void = () => {};
+  /** Вызывается каждый кадр после отрисовки (для позиционирования HTML поверх 3D) */
+  onFrame: () => void = () => {};
+  private penDown = false;
+  private lastPenAt = -Infinity;
+  /** На устройстве есть перо — палец больше не рисует в эскизе */
+  private sawPen = false;
   /** Что выбирает касание по телу: тело целиком, грань или ребро */
   pickMode: PickMode = "body";
   /** Подсветка под курсором/стилусом (мышь, перо): грани, рёбра или ничего */
@@ -227,6 +238,8 @@ export class Viewport {
     this.orbit.dampingFactor = 0.15;
     this.orbit.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
     this.orbit.target.set(0, 0, 20);
+    // Масштаб колесом/щипком — к точке под курсором, а не к центру экрана
+    this.orbit.zoomToCursor = true;
     this.orbit.addEventListener("start", () => (this.anim = null));
 
     this.gizmo = new TransformControls(this.camera, this.renderer.domElement);
@@ -288,6 +301,7 @@ export class Viewport {
     this.renderer.render(this.scene, this.camera);
     this.updateViewCube();
     this.updateDimLabels();
+    this.onFrame();
   }
 
   private axes(len: number) {
@@ -476,34 +490,79 @@ export class Viewport {
   // ---------- указатель ----------
 
   /**
-   * Вне эскиза: короткое касание без движения = выбор, остальное — жест камеры.
-   * В эскизе: один палец/стилус/ЛКМ рисует, второй палец отменяет штрих (жест камеры).
+   * Касания и перо.
+   * - Ладонь: касания пальцем, пока перо у экрана (или в течение PALM_MS после), игнорируются.
+   * - Если перо хоть раз использовалось, в эскизе рисует только перо, а палец двигает вид.
+   * - Касание двумя/тремя пальцами без движения — отмена/повтор.
+   * - Вне эскиза короткое касание без движения = выбор, остальное — жест камеры;
+   *   вращение идёт вокруг точки модели под пальцем.
    */
   private setupPointer() {
     const el = this.renderer.domElement;
     const downs = new Map<number, { x: number; y: number; t: number }>();
+    const ignored = new Set<number>();
     let multiTouch = false;
     let box: { x: number; y: number } | null = null;
-    // capture: сработать раньше обработчика манипулятора, который выставит gizmoBusy
+    // Жест «касание несколькими пальцами»: сколько пальцев было и сдвигались ли они
+    let tap: { t0: number; max: number; moved: boolean; starts: Map<number, [number, number]> } | null = null;
+
+    const swallow = (e: PointerEvent) => {
+      e.stopImmediatePropagation();
+      e.preventDefault();
+    };
+    // capture: сработать раньше OrbitControls и манипулятора
     el.addEventListener(
       "pointerdown",
       (e) => {
+        if (e.pointerType === "pen") {
+          this.penDown = true;
+          this.lastPenAt = performance.now();
+          if (!this.sawPen) {
+            this.sawPen = true;
+            this.updateTouchMap();
+          }
+        }
+        if (e.pointerType === "touch" && (this.penDown || performance.now() - this.lastPenAt < PALM_MS)) {
+          ignored.add(e.pointerId);
+          return swallow(e);
+        }
+        if (e.pointerType === "touch") {
+          if (!tap) tap = { t0: performance.now(), max: 0, moved: false, starts: new Map() };
+          tap.starts.set(e.pointerId, [e.clientX, e.clientY]);
+          tap.max = Math.max(tap.max, tap.starts.size);
+        }
         downs.set(e.pointerId, { x: e.clientX, y: e.clientY, t: performance.now() });
         if (downs.size > 1) {
           if (!multiTouch && this.sketchPlane) this.emitSketch("cancel", e);
           multiTouch = true;
         }
         if (downs.size === 1) this.gizmoBusy = false;
-        if (this.sketchPlane && downs.size === 1 && e.button === 0) this.emitSketch("down", e);
+        // В эскизе рисует перо/мышь; палец — только если пера на устройстве не было
+        const draws = !(e.pointerType === "touch" && this.sawPen);
+        if (this.sketchPlane && downs.size === 1 && e.button === 0 && draws) this.emitSketch("down", e);
         box = !this.sketchPlane && this.boxSelect && downs.size === 1 && e.button === 0 ? { x: e.clientX, y: e.clientY } : null;
         if (downs.size > 1) this.boxEl.style.display = "none";
+        // Вращение вокруг точки модели под пальцем/курсором
+        const rotates = e.pointerType === "touch" || (e.pointerType === "mouse" && e.button === 0);
+        if (!this.sketchPlane && !this.boxSelect && downs.size === 1 && rotates) this.pivotAt(e.clientX, e.clientY);
+      },
+      { capture: true },
+    );
+    el.addEventListener(
+      "pointermove",
+      (e) => {
+        if (e.pointerType === "pen") this.lastPenAt = performance.now();
+        if (ignored.has(e.pointerId)) return swallow(e);
+        const s = tap?.starts.get(e.pointerId);
+        if (tap && s && Math.hypot(e.clientX - s[0], e.clientY - s[1]) > GESTURE_MOVE) tap.moved = true;
       },
       { capture: true },
     );
     el.addEventListener("pointermove", (e) => {
       if (this.sketchPlane) {
         if (multiTouch) return;
-        if (downs.has(e.pointerId)) this.emitSketch("move", e);
+        const draws = !(e.pointerType === "touch" && this.sawPen);
+        if (downs.has(e.pointerId) && draws) this.emitSketch("move", e);
         else if (e.pointerType !== "touch") this.emitSketch("hover", e);
         return;
       }
@@ -518,13 +577,37 @@ export class Viewport {
       if (e.pointerType !== "touch" && e.buttons === 0) this.hoverQueued = { x: e.clientX, y: e.clientY };
     });
     el.addEventListener("pointerleave", () => this.clearHover());
+
+    const endTap = (e: PointerEvent) => {
+      if (!tap || e.pointerType !== "touch") return;
+      tap.starts.delete(e.pointerId);
+      if (tap.starts.size) return;
+      const quick = performance.now() - tap.t0 < GESTURE_MS;
+      if (quick && !tap.moved && (tap.max === 2 || tap.max === 3)) this.onGesture(tap.max === 2 ? "undo" : "redo");
+      tap = null;
+    };
+    el.addEventListener(
+      "pointerup",
+      (e) => {
+        if (e.pointerType === "pen") {
+          this.penDown = false;
+          this.lastPenAt = performance.now();
+        }
+        if (ignored.delete(e.pointerId)) return swallow(e);
+        endTap(e);
+      },
+      { capture: true },
+    );
     const up = (e: PointerEvent) => {
       const d = downs.get(e.pointerId);
       downs.delete(e.pointerId);
       const wasMulti = multiTouch;
       if (downs.size === 0) multiTouch = false;
       if (!d || wasMulti || e.button > 0) return;
-      if (this.sketchPlane) return this.emitSketch("up", e);
+      if (this.sketchPlane) {
+        if (e.pointerType === "touch" && this.sawPen) return;
+        return this.emitSketch("up", e);
+      }
       if (this.gizmoBusy) return;
       const moved = Math.hypot(e.clientX - d.x, e.clientY - d.y);
       if (box && moved > TAP_MAX_MOVE) {
@@ -540,9 +623,37 @@ export class Viewport {
     };
     el.addEventListener("pointerup", up);
     el.addEventListener("pointercancel", (e) => {
+      if (e.pointerType === "pen") this.penDown = false;
+      ignored.delete(e.pointerId);
       downs.delete(e.pointerId);
+      tap = null;
       if (downs.size === 0) multiTouch = false;
     });
+  }
+
+  /**
+   * Центр вращения — на глубине точки модели под пальцем. Цель сдвигается вдоль
+   * линии взгляда, поэтому вид не дёргается, а модель вращается «вокруг себя».
+   */
+  private pivotAt(cx: number, cy: number) {
+    this.raycaster.setFromCamera(this.ndc(cx, cy), this.camera);
+    const hit = this.raycaster.intersectObjects([...this.groups.values()].map((g) => g.children[0]), false)[0];
+    if (!hit) return;
+    const fwd = this.camera.getWorldDirection(new THREE.Vector3());
+    const depth = hit.point.clone().sub(this.camera.position).dot(fwd);
+    if (depth > 0) this.orbit.target.copy(this.camera.position).addScaledVector(fwd, depth);
+  }
+
+  /** Один палец в эскизе: при наличии пера — сдвиг вида, иначе ничего (рисует палец) */
+  private updateTouchMap() {
+    this.orbit.touches.ONE = this.sketchPlane && this.sawPen ? THREE.TOUCH.PAN : THREE.TOUCH.ROTATE;
+  }
+
+  /** Экранная точка (px от левого верхнего угла 3D-окна) для мировой точки */
+  screenOf(p: Vec3): { x: number; y: number; visible: boolean } {
+    const v = v3(p).project(this.camera);
+    const el = this.renderer.domElement;
+    return { x: ((v.x + 1) / 2) * el.clientWidth, y: ((1 - v.y) / 2) * el.clientHeight, visible: v.z < 1 && Math.abs(v.x) <= 1.2 && Math.abs(v.y) <= 1.2 };
   }
 
   private pick(cx: number, cy: number, mode: PickMode = this.pickMode, withProfiles = true): Pick {
@@ -965,6 +1076,7 @@ export class Viewport {
     this.clearHover();
     this.gizmo.detach();
     this.orbit.enableRotate = false;
+    this.updateTouchMap();
     // Камера смотрит прямо на плоскость; крошечный сдвиг вниз по Y эскиза
     // убирает вырожденный случай «взгляд параллелен оси up» для горизонтальных плоскостей
     const dist = Math.max(this.camera.position.distanceTo(this.orbit.target), 150);
@@ -994,6 +1106,7 @@ export class Viewport {
     this.sketchPlane = null;
     this.applyXray();
     this.orbit.enableRotate = !this.boxSelect;
+    this.updateTouchMap();
     if (this.sketchGrid) this.scene.remove(this.sketchGrid);
     this.sketchGrid = null;
     this.grid.visible = true;
