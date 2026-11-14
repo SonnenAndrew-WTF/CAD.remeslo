@@ -1,0 +1,67 @@
+# Своя сборка CAD-ядра: replicad-opencascadejs той же версии, что в package.json,
+# плюс классы из occ/extra-symbols.txt. Результат — артефакт replicad-single,
+# его файлы кладутся в vendor/replicad-opencascadejs/dist.
+name: Сборка ядра OpenCascade
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/occ-kernel.yml"
+      - "occ/**"
+
+env:
+  # replicad-opencascadejs 1.1.0 — совместим с replicad 1.2.0 из package.json
+  REPLICAD_COMMIT: e4b05f67dc
+  OCJS_IMAGE: ghcr.io/taucad/opencascade.js:canary-ebd263f1-single-threaded
+  YTT_URL: https://github.com/carvel-dev/ytt/releases/download/v0.55.4/ytt-linux-amd64
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Исходники сборки replicad-opencascadejs
+        run: |
+          git clone --filter=blob:none https://github.com/sgenoud/replicad.git replicad
+          git -C replicad checkout "$REPLICAD_COMMIT"
+
+      - name: Утилита ytt (генерация конфига сборки)
+        run: |
+          sudo curl -fsSL "$YTT_URL" -o /usr/local/bin/ytt
+          sudo chmod +x /usr/local/bin/ytt
+
+      - name: Добавить классы из occ/extra-symbols.txt
+        working-directory: replicad/packages/replicad-opencascadejs
+        run: |
+          defaults=build-source/defaults.yml
+          grep -vE '^\s*(#|$)' "$GITHUB_WORKSPACE/occ/extra-symbols.txt" | while read -r sym; do
+            if grep -q "symbol: $sym\$" "$defaults"; then
+              echo "уже есть: $sym"
+            else
+              # Вставляем рядом с BRepBuilderAPI_Transform — тот же отступ списка привязок
+              sed -i "/^    - symbol: BRepBuilderAPI_Transform\$/a\\    - symbol: $sym" "$defaults"
+              echo "добавлен: $sym"
+            fi
+          done
+          grep -n "BRepBuilderAPI_" "$defaults"
+
+      - name: Сборка (линковка) ядра
+        working-directory: replicad/packages/replicad-opencascadejs
+        run: |
+          ytt -f build-source/ --output-files build-config
+          cd build-config
+          docker run --rm -v "$(pwd):/src" -u "$(id -u):$(id -g)" "$OCJS_IMAGE" link custom_build_single.yml
+          ls -la replicad_single.*
+          grep -c "BRepBuilderAPI_GTransform" replicad_single.d.ts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: replicad-single
+          path: |
+            replicad/packages/replicad-opencascadejs/build-config/replicad_single.js
+            replicad/packages/replicad-opencascadejs/build-config/replicad_single.wasm
+            replicad/packages/replicad-opencascadejs/build-config/replicad_single.d.ts
+          retention-days: 30
