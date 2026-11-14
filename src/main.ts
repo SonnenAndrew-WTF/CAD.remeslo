@@ -235,14 +235,14 @@ function updatePrimitive(b: Body, prim: Primitive) {
 let gizmoMode: "translate" | "scale" = "translate";
 
 /**
- * Неравномерный масштаб произвольного тела ядро не поддерживает (нет GTransform),
- * поэтому по осям тянутся только примитивы, у которых меняются параметры.
+ * Своя сборка ядра умеет растягивать любые тела (BRepBuilderAPI_GTransform),
+ * поэтому все оси свободны. Ограничение оставлено как точка расширения.
  */
-function scaleRuleOf(b: Body): "free" | "xy" | "uniform" {
-  if (b.prim?.kind === "box") return "free";
-  if (b.prim?.kind === "cylinder") return "xy";
-  return "uniform";
+function scaleRuleOf(_b: Body): "free" | "xy" | "uniform" {
+  return "free";
 }
+
+const uniform = (sx: number, sy: number, sz: number) => Math.abs(sx - sy) < 1e-9 && Math.abs(sy - sz) < 1e-9;
 
 view.scaleRule = (id) => {
   const b = doc.get(id);
@@ -264,14 +264,17 @@ function scaleBody(id: number, [sx, sy, sz]: Vec3) {
     if (p?.kind === "box") {
       prim = { ...p, w: r6(p.w * sx), d: r6(p.d * sy), h: r6(p.h * sz) };
       offset = [c[0], c[1], c[2] - prim.h / 2];
-    } else if (p?.kind === "cylinder") {
+    } else if (p?.kind === "cylinder" && Math.abs(sx - sy) < 1e-9) {
       prim = { ...p, r: r6(p.r * sx), h: r6(p.h * sz) };
       offset = [c[0], c[1], c[2] - prim.h / 2];
-    } else if (p?.kind === "sphere") {
+    } else if (p?.kind === "sphere" && uniform(sx, sy, sz)) {
       prim = { ...p, r: r6(p.r * sx) };
       offset = [c[0], c[1], c[2] - prim.r];
     }
-    const shape = prim ? K.buildPrimitive(prim, offset) : K.scaleUniform(b.shape, sx, c);
+    // Остальное (эллиптический цилиндр, эллипсоид, любые тела) — растяжение в ядре
+    const shape = prim ? K.buildPrimitive(prim, offset) : K.scaleAxes(b.shape, [sx, sy, sz], c);
+    if (!prim && !uniform(sx, sy, sz) && b.shape.faces.some((f) => f.geomType !== "PLANE"))
+      warn("Растяжение превратило кривые грани в сплайны — скругления и оболочка на этом теле будут медленнее");
     doc.replace([{ ...b, shape, prim, offset }]);
   });
 }
@@ -2152,7 +2155,15 @@ function renderBodyPanel(root: HTMLElement, b: Body) {
   if (gizmoMode === "scale") {
     const rule = scaleRuleOf(b);
     root.append(
-      el("p", { className: "hint", textContent: rule === "free" ? "Тяните кубики на осях — растяжение по оси, центральный — общий масштаб." : rule === "xy" ? "У цилиндра X и Y масштабируются вместе, высота — отдельно." : "Сложные тела и сферы масштабируются только равномерно." }),
+      el("p", { className: "hint", textContent: rule === "free" ? "Тяните кубики на осях — растяжение по оси, центральный — общий масштаб." : rule === "xy" ? "У цилиндра X и Y масштабируются вместе, высота — отдельно." : "Это тело масштабируется только равномерно." }),
+      ...(["X", "Y", "Z"] as const).map((a, i) =>
+        numberField(`Растяжение по ${a}, %`, 100, (v) => {
+          if (!(v > 0)) return toast("Масштаб должен быть больше нуля", true);
+          const f: Vec3 = [1, 1, 1];
+          f[i] = v / 100;
+          scaleBody(b.id, f);
+        }),
+      ),
       numberField("Общий масштаб, %", 100, (v) => (v > 0 ? scaleBody(b.id, [v / 100, v / 100, v / 100]) : toast("Масштаб должен быть больше нуля", true))),
     );
   }

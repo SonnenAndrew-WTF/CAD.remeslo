@@ -86,6 +86,26 @@ export function edgeOp(s: Shape, kind: "fillet" | "chamfer", edgeIds: number[], 
   return kind === "fillet" ? s.clone().fillet(pick) : s.clone().chamfer(pick);
 }
 
+/**
+ * Плоская ли грань. После растяжения (GTransform) ядро переводит даже плоскости в сплайны,
+ * поэтому кроме типа PLANE проверяем геометрию: нормали в нескольких точках совпадают.
+ */
+function isFlat(f: Face): boolean {
+  if (f.geomType === "PLANE") return true;
+  if (f.geomType !== "BSPLINE_SURFACE" && f.geomType !== "BEZIER_SURFACE") return false;
+  const { uMin, uMax, vMin, vMax } = f.UVBounds;
+  const n0 = f.normalAt();
+  const p0 = f.center;
+  for (const [a, b] of [[0.1, 0.1], [0.9, 0.1], [0.9, 0.9], [0.1, 0.9], [0.5, 0.3]]) {
+    const p = f.pointOnSurface(uMin + (uMax - uMin) * a, vMin + (vMax - vMin) * b);
+    const n = f.normalAt(p);
+    // Нормаль та же и точка лежит в той же плоскости
+    if (Math.abs(n.x * n0.x + n.y * n0.y + n.z * n0.z) < 0.99999) return false;
+    if (Math.abs((p.x - p0.x) * n0.x + (p.y - p0.y) * n0.y + (p.z - p0.z) * n0.z) > 1e-4) return false;
+  }
+  return true;
+}
+
 function findFace(s: Shape, faceId: number): Face {
   const f = s.faces.find((x) => x.hashCode === faceId);
   if (!f) throw new Error("Грань не найдена");
@@ -97,7 +117,7 @@ export function faceFrame(s: Shape, faceId: number): { center: Vec3; normal: Vec
   const f = findFace(s, faceId);
   const c = f.center;
   const n = f.normalAt();
-  return { center: [c.x, c.y, c.z], normal: [n.x, n.y, n.z], planar: f.geomType === "PLANE" };
+  return { center: [c.x, c.y, c.z], normal: [n.x, n.y, n.z], planar: isFlat(f) };
 }
 
 /**
@@ -266,6 +286,32 @@ export function edgeFrame(s: Shape, edgeId: number): { mid: Vec3; dir: Vec3 } {
 /** Равномерный масштаб относительно точки */
 export const scaleUniform = (s: Shape, k: number, center: Vec3): Shape => s.clone().scale(k, center);
 
+/**
+ * Растяжение по осям относительно точки (своя сборка ядра с BRepBuilderAPI_GTransform).
+ * Аналитические поверхности при неравномерном масштабе ядро переводит в сплайны:
+ * цилиндр становится эллиптическим, поэтому последующие скругления на таком теле медленнее.
+ */
+export function scaleAxes(s: Shape, [sx, sy, sz]: Vec3, c: Vec3): Shape {
+  if (Math.abs(sx - sy) < 1e-9 && Math.abs(sy - sz) < 1e-9) return scaleUniform(s, sx, c);
+  const oc = getOC();
+  const g = new oc.gp_GTrsf();
+  // x' = s·(x − c) + c  →  матрица diag(s) и перенос c − s·c
+  const t = new oc.gp_XYZ(c[0] * (1 - sx), c[1] * (1 - sy), c[2] * (1 - sz));
+  g.SetValue(1, 1, sx);
+  g.SetValue(2, 2, sy);
+  g.SetValue(3, 3, sz);
+  g.SetTranslationPart(t);
+  const builder = new oc.BRepBuilderAPI_GTransform(s.wrapped, g, true);
+  try {
+    if (!builder.IsDone()) throw new Error("Растяжение не удалось");
+    return cast(builder.Shape()) as Shape;
+  } finally {
+    builder.delete();
+    t.delete();
+    g.delete();
+  }
+}
+
 /** Поворот на угол (градусы) вокруг оси, проходящей через точку */
 export const rotate = (s: Shape, angle: number, center: Vec3, axis: Vec3): Shape => s.clone().rotate(angle, center, axis);
 
@@ -365,7 +411,7 @@ export function edgeEnds(s: Shape, edgeId: number): [Vec3, Vec3] {
 /** Плоскость эскиза на грани тела (только для плоских граней) */
 export function facePlane(s: Shape, faceId: number): SketchPlane | null {
   const face = s.faces.find((f) => f.hashCode === faceId);
-  if (!face || face.geomType !== "PLANE") return null;
+  if (!face || !isFlat(face)) return null;
   const n = face.normalAt();
   const c = face.center;
   return planeFrom([c.x, c.y, c.z], [n.x, n.y, n.z]);
