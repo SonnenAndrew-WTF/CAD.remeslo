@@ -28,7 +28,7 @@ import {
   type Shape3D,
   type AnyShape,
 } from "replicad";
-import { corners, planeFrom, scale, type Profile, type SketchPlane, type V2, type Vec3 } from "./sketch";
+import { corners, planeFrom, scale, toWorld, type Profile, type SketchPlane, type V2, type Vec3 } from "./sketch";
 
 export type Shape = Shape3D;
 export type { Vec3, Profile, SketchPlane };
@@ -179,9 +179,20 @@ export function shell(s: Shape, faceIds: number[], thickness: number): Shape {
   throw new Error("Не удалось построить оболочку");
 }
 
+/**
+ * Точность сетки зависит от размера тела: у крупных тел фиксированные 0.05 мм
+ * давали миллионы треугольников и долгую триангуляцию в ядре.
+ */
+function meshTolerance(s: Shape): number {
+  const [[x0, y0, z0], [x1, y1, z1]] = s.boundingBox.bounds;
+  const diag = Math.hypot(x1 - x0, y1 - y0, z1 - z0);
+  return Math.min(0.5, Math.max(0.01, diag * 0.0006));
+}
+
 export function mesh(s: Shape): MeshData {
-  const m = s.mesh({ tolerance: 0.05, angularTolerance: 0.2 });
-  const e = s.meshEdges({ tolerance: 0.05, angularTolerance: 0.2 });
+  const opts = { tolerance: meshTolerance(s), angularTolerance: 0.2 };
+  const m = s.mesh(opts);
+  const e = s.meshEdges(opts);
   return {
     vertices: Float32Array.from(m.vertices),
     normals: Float32Array.from(m.normals),
@@ -229,6 +240,9 @@ function profileDrawing(p: Profile): Drawing {
       for (const q of p.pts.slice(1)) pen = pen.lineTo(q);
       return filletCorners(pen.close(), p.pts, p.radii);
     }
+    case "path":
+    case "axis":
+      throw new Error("Контур не замкнут — его нельзя вытянуть или повернуть");
   }
 }
 
@@ -270,6 +284,57 @@ export function extrudeProfile(plane: SketchPlane, p: Profile, distance: number,
   const pl = new Plane(plane.origin, plane.xDir, plane.normal);
   const dir = scale(plane.normal, Math.sign(distance) || 1);
   return profileDrawing(p).sketchOnPlane(pl).extrude(d, { extrusionDirection: dir }) as Shape;
+}
+
+/**
+ * Тело вращения: профиль поворачивается вокруг оси эскиза (точки a→b в координатах эскиза).
+ * Если ось пересекает профиль, ядро построит самопересекающееся тело — проверяем заранее.
+ */
+export function revolveProfile(plane: SketchPlane, p: Profile, a: V2, b: V2, angle: number): Shape {
+  const pl = new Plane(plane.origin, plane.xDir, plane.normal);
+  const o = toWorld(plane, a);
+  const e = toWorld(plane, b);
+  const dir: Vec3 = [e[0] - o[0], e[1] - o[1], e[2] - o[2]];
+  return profileDrawing(p).sketchOnPlane(pl).revolve(dir, { origin: o, angle }) as Shape;
+}
+
+/** Ось вращения/массива по ребру: прямое — вдоль ребра, круговое — через центр по нормали */
+export function edgeAxis(s: Shape, edgeId: number): { origin: Vec3; dir: Vec3; kind: "line" | "circle" } {
+  const e = s.edges.find((x) => x.hashCode === edgeId);
+  if (!e) throw new Error("Ребро не найдено");
+  const P = (t: number): Vec3 => {
+    const v = e.pointAt(t);
+    return [v.x, v.y, v.z];
+  };
+  if (e.geomType === "LINE") {
+    const [a, b] = [P(0), P(1)];
+    const d: Vec3 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    const l = Math.hypot(...d);
+    return { origin: a, dir: [d[0] / l, d[1] / l, d[2] / l], kind: "line" };
+  }
+  if (e.geomType !== "CIRCLE") throw new Error("Нужно прямое или круговое ребро");
+  // Центр окружности по трём точкам дуги
+  const [a, b, c] = [P(0), P(0.33), P(0.66)];
+  const sub = (u: Vec3, v: Vec3): Vec3 => [u[0] - v[0], u[1] - v[1], u[2] - v[2]];
+  const cross = (u: Vec3, v: Vec3): Vec3 => [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+  const dot = (u: Vec3, v: Vec3) => u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+  const ab = sub(b, a);
+  const ac = sub(c, a);
+  const n = cross(ab, ac);
+  const n2 = dot(n, n);
+  const t1 = cross(n, ab).map((x) => x * dot(ac, ac));
+  const t2 = cross(ac, n).map((x) => x * dot(ab, ab));
+  const center: Vec3 = [a[0] + (t1[0] + t2[0]) / (2 * n2), a[1] + (t1[1] + t2[1]) / (2 * n2), a[2] + (t1[2] + t2[2]) / (2 * n2)];
+  const l = Math.sqrt(n2);
+  return { origin: center, dir: [n[0] / l, n[1] / l, n[2] / l], kind: "circle" };
+}
+
+/** Ось цилиндрической грани — по её круговому ребру */
+export function faceAxis(s: Shape, faceId: number): { origin: Vec3; dir: Vec3 } | null {
+  const f = s.faces.find((x) => x.hashCode === faceId);
+  if (!f || f.geomType !== "CYLINDRE") return null;
+  const e = f.edges.find((x) => x.geomType === "CIRCLE");
+  return e ? edgeAxis(s, e.hashCode) : null;
 }
 
 /** Вершины тела (концы рёбер) — для плоскости по трём точкам */

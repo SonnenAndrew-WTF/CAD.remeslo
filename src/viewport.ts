@@ -8,7 +8,7 @@ import { LineSegmentsGeometry } from "three/addons/lines/LineSegmentsGeometry.js
 import { LineMaterial } from "three/addons/lines/LineMaterial.js";
 import type { Body, RefPlane, Sketch } from "./doc";
 import { mesh, type Shape } from "./kernel";
-import { dot, outline, sub, toLocal, toWorld, type Profile, type SketchPlane, type V2, type Vec3 } from "./sketch";
+import { closestOnSegment, dot, isClosed, outline, sub, toLocal, toWorld, type Profile, type SketchPlane, type V2, type Vec3 } from "./sketch";
 
 const TAP_MAX_MOVE = 10; // px
 const TAP_MAX_TIME = 450; // ms
@@ -20,6 +20,8 @@ const HOVER_COLOR = 0x5dd39e;
 const VIEW_ANIM_MS = 350;
 const CUBE_HALF = 30; // px — половина ребра кубика вида
 const ISO_DIR: Vec3 = [0.5, -0.68, 0.53];
+/** Больше стольких треугольников — тело тяжело отрисовывать и выбирать на планшете */
+const HEAVY_TRIANGLES = 400_000;
 
 export type PickMode = "body" | "face" | "edge" | "vertex";
 export type Projection = "persp" | "ortho";
@@ -58,6 +60,8 @@ export interface DraftView {
   handles?: V2[];
   selected?: V2[];
   refLines?: [V2, V2][];
+  /** Элемент под курсором/пером: точки и отрезки/кривые */
+  hover?: { pts: V2[]; lines: V2[][] };
 }
 
 export type SketchEvent = "down" | "move" | "up" | "hover" | "cancel";
@@ -112,9 +116,16 @@ function makeGrid(size: number, divisions: number, [major, minor]: [number, numb
 export class Viewport {
   onTap: (pick: Pick) => void = () => {};
   onMoveEnd: (bodyId: number, delta: Vec3) => void = () => {};
-  /** p — точка с привязкой, raw — точно под пальцем (для попадания в ручки и линии) */
-  onSketch: (type: SketchEvent, p: V2, snappedToPoint: boolean, raw: V2) => void = () => {};
+  /**
+   * p — точка с привязкой, raw — точно под пальцем (для попадания в ручки и линии),
+   * snap — что сработало: подпись привязки («конец», «середина», «на ребре»…) или null
+   */
+  onSketch: (type: SketchEvent, p: V2, snappedToPoint: boolean, raw: V2, snap: string | null) => void = () => {};
+  /** Наведение на тело в режиме «Тело» */
+  hoverBody = false;
   onScaleEnd: (bodyId: number, factors: Vec3) => void = () => {};
+  /** Тело получилось слишком детальным для сетки (предупреждение о пределах) */
+  onHeavyMesh: (bodyName: string, triangles: number) => void = () => {};
   /** Ограничение масштаба по телу: свободно по осям, X=Y (цилиндр) или только равномерно */
   scaleRule: (bodyId: number) => "free" | "xy" | "uniform" = () => "uniform";
   onDimEdit: (id: string, label: HTMLElement) => void = () => {};
@@ -162,6 +173,10 @@ export class Viewport {
   private sketchPlane: SketchPlane | null = null;
   private sketchGrid: THREE.Object3D | null = null;
   private snapTargets: V2[] = [];
+  private snapKinds: string[] = [];
+  private snapLines: [V2, V2][] = [];
+  private hoverBodyId: number | null = null;
+  private cubeAxes!: SVGSVGElement;
   private dimLayer: HTMLDivElement;
   private dimLabels: { el: HTMLElement; at: THREE.Vector3 }[] = [];
   /** Подписи по id — переиспользуем, чтобы при движении мыши они не пересоздавались */
@@ -374,6 +389,24 @@ export class Viewport {
       cube.append(face);
     }
     scene.append(cube);
+    // Оси X/Y/Z из угла кубика — SVG поверх, пересчитывается вместе с поворотом камеры
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("class", "vc-axes");
+    svg.setAttribute("viewBox", "-48 -48 96 96");
+    for (const [axis, color] of [["X", "#ff5d5d"], ["Y", "#5dd39e"], ["Z", "#4c8dff"]]) {
+      const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      line.setAttribute("stroke", color);
+      line.setAttribute("stroke-width", "2.5");
+      line.setAttribute("stroke-linecap", "round");
+      line.dataset.axis = axis;
+      const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      text.setAttribute("fill", color);
+      text.textContent = axis;
+      text.dataset.axis = axis;
+      svg.append(line, text);
+    }
+    scene.append(svg);
+    this.cubeAxes = svg;
     const buttons = Object.assign(document.createElement("div"), { className: "vc-buttons" });
     const home = Object.assign(document.createElement("button"), { textContent: "⌂", title: "Изометрия" });
     home.addEventListener("click", () => this.setView(ISO_DIR));
@@ -396,6 +429,25 @@ export class Viewport {
     if (m !== this.cubeMatrix) {
       this.cubeMatrix = m;
       this.cubeEl.style.transform = m;
+      // Проекция мировых осей в экран кубика: x вправо, y вниз
+      const h = CUBE_HALF;
+      const proj = (x: number, y: number, z: number) => [e[0] * x + e[4] * y + e[8] * z, -(e[1] * x + e[5] * y + e[9] * z)];
+      const [ox, oy] = proj(-h, -h, -h);
+      const len = h * 2.4;
+      const dirs: Record<string, [number, number, number]> = { X: [len, 0, 0], Y: [0, len, 0], Z: [0, 0, len] };
+      for (const el of Array.from(this.cubeAxes.children) as SVGElement[]) {
+        const d = dirs[el.dataset.axis!];
+        const [tx, ty] = proj(-h + d[0], -h + d[1], -h + d[2]);
+        if (el.tagName === "line") {
+          el.setAttribute("x1", String(ox));
+          el.setAttribute("y1", String(oy));
+          el.setAttribute("x2", String(tx));
+          el.setAttribute("y2", String(ty));
+        } else {
+          el.setAttribute("x", String(tx + (tx - ox) * 0.12 - 3));
+          el.setAttribute("y", String(ty + (ty - oy) * 0.12 + 4));
+        }
+      }
     }
   }
 
@@ -683,7 +735,34 @@ export class Viewport {
     if (sub && g) this.overlay(g, sub.faces, sub.edges, HL_COLOR, "hl");
   }
 
+  /** Подсветка тела под курсором: лёгкое свечение материала (выбранные не трогаем) */
+  private hoverBodyAt(cx: number, cy: number) {
+    const p = this.pick(cx, cy, "body", false);
+    const id = p?.kind === "body" ? p.id : null;
+    if (id === this.hoverBodyId) return;
+    const set = (bid: number | null, on: boolean) => {
+      const g = bid !== null ? this.groups.get(bid) : undefined;
+      if (!g) return;
+      const mat = (g.children[0] as THREE.Mesh).material as THREE.MeshStandardMaterial;
+      if (on) {
+        if (mat.emissiveIntensity > 0) return; // выбранное тело уже подсвечено
+        g.userData.hoverTint = true;
+        mat.emissive.set(0x4fd1e8);
+        mat.emissiveIntensity = 0.18;
+      } else if (g.userData.hoverTint) {
+        g.userData.hoverTint = false;
+        mat.emissive.set(0x000000);
+        mat.emissiveIntensity = 0;
+      }
+    };
+    set(this.hoverBodyId, false);
+    set(id, true);
+    this.hoverBodyId = id;
+    this.renderer.domElement.style.cursor = id !== null ? "pointer" : "";
+  }
+
   private hover(cx: number, cy: number) {
+    if (this.hoverBody && !this.hoverMode && !this.gizmo.dragging) return this.hoverBodyAt(cx, cy);
     if (!this.hoverMode || this.gizmo.dragging) return this.clearHover();
     const p = this.pick(cx, cy, this.hoverMode, false);
     let key = "";
@@ -710,6 +789,7 @@ export class Viewport {
 
   private build(body: Body): THREE.Group {
     const m = mesh(body.shape);
+    if (m.triangles.length / 3 > HEAVY_TRIANGLES) this.onHeavyMesh(body.name, m.triangles.length / 3);
     const geo = new THREE.BufferGeometry();
     geo.setAttribute("position", new THREE.BufferAttribute(m.vertices, 3));
     geo.setAttribute("normal", new THREE.BufferAttribute(m.normals, 3));
@@ -740,10 +820,29 @@ export class Viewport {
     return g;
   }
 
+  /** Незамкнутая линия; ось — штрихпунктиром */
+  private openLine(pts: V2[], color: number, dashed: boolean, overlay = false) {
+    const geo = new THREE.BufferGeometry().setFromPoints(pts.map(([x, y]) => new THREE.Vector3(x, y, 0)));
+    const mat = dashed
+      ? new THREE.LineDashedMaterial({ color, dashSize: 6, gapSize: 3, depthTest: !overlay })
+      : new THREE.LineBasicMaterial({ color, depthTest: !overlay });
+    const line = new THREE.Line(geo, mat);
+    if (dashed) line.computeLineDistances();
+    if (overlay) line.renderOrder = 2;
+    return line;
+  }
+
   private buildSketch(sk: Sketch): THREE.Group {
     const g = new THREE.Group();
     sk.profiles.forEach((p, index) => {
       const pts = outline(p).map(([x, y]) => new THREE.Vector2(x, y));
+      if (!isClosed(p)) {
+        const ln = this.openLine(pts.map((q) => [q.x, q.y] as V2), this.palette.sketchLine, p.kind === "axis");
+        ln.matrixAutoUpdate = false;
+        ln.matrix.copy(planeMatrix(sk.plane, 0.06));
+        g.add(ln);
+        return;
+      }
       // Заливка чуть приподнята над плоскостью, чтобы не мерцать на грани тела
       const fill = new THREE.Mesh(
         new THREE.ShapeGeometry(new THREE.Shape(pts)),
@@ -815,6 +914,8 @@ export class Viewport {
       this.sketchRoot.add(g);
     }
 
+    this.applyXray();
+    this.hoverBodyId = null;
     if (this.handleState) return;
     const single = selection.length === 1 ? this.groups.get(selection[0]) : undefined;
     this.gizmo.showX = this.gizmo.showY = true;
@@ -873,10 +974,25 @@ export class Viewport {
     // Общая сетка в плоскости XY совпала бы с сеткой эскиза со сдвигом — получалась «двойная» сетка
     this.grid.visible = false;
     this.buildSketchGrid(pl);
+    this.applyXray();
+  }
+
+  /** В эскизе тела полупрозрачны — эскиз внутри тела виден насквозь */
+  private applyXray() {
+    const on = !!this.sketchPlane;
+    for (const g of this.groups.values()) {
+      const mat = (g.children[0] as THREE.Mesh).material as THREE.MeshStandardMaterial;
+      if (mat.transparent === on && mat.opacity === (on ? 0.3 : 1)) continue;
+      mat.transparent = on;
+      mat.opacity = on ? 0.3 : 1;
+      mat.depthWrite = !on;
+      mat.needsUpdate = true;
+    }
   }
 
   exitSketch() {
     this.sketchPlane = null;
+    this.applyXray();
     this.orbit.enableRotate = !this.boxSelect;
     if (this.sketchGrid) this.scene.remove(this.sketchGrid);
     this.sketchGrid = null;
@@ -885,8 +1001,11 @@ export class Viewport {
     this.setDimLabels([]);
   }
 
-  setSnapTargets(pts: V2[]) {
+  /** Точки привязки и (необязательно) их подписи; линии — привязка «на линии/ребре» */
+  setSnapTargets(pts: V2[], kinds: string[] = [], lines: [V2, V2][] = []) {
     this.snapTargets = pts;
+    this.snapKinds = kinds;
+    this.snapLines = lines;
   }
 
   /** Размер мирового миллиметра в пикселях (на расстоянии цели) */
@@ -913,18 +1032,28 @@ export class Viewport {
     let p = raw;
     const ppu = this.pxPerUnit();
     let best: V2 | null = null;
+    let bestKind: string | null = null;
     let bestD = SNAP_RADIUS / ppu;
-    for (const q of this.snapTargets) {
+    this.snapTargets.forEach((q, i) => {
       const d = Math.hypot(q[0] - p[0], q[1] - p[1]);
-      if (d < bestD) [best, bestD] = [q, d];
+      if (d < bestD) [best, bestD, bestKind] = [q, d, this.snapKinds[i] ?? "точка"];
+    });
+    // Точки важнее линий; на линию прилипаем, только если рядом нет точки
+    if (!best) {
+      let lineD = (SNAP_RADIUS * 0.7) / ppu;
+      for (const [a, b] of this.snapLines) {
+        const q = closestOnSegment(raw, a, b);
+        const d = Math.hypot(q[0] - raw[0], q[1] - raw[1]);
+        if (d < lineD) [best, lineD, bestKind] = [q, d, "на линии"];
+      }
     }
-    if (best) p = [...best];
+    if (best) p = [...(best as V2)];
     else {
       // Без привязки к сетке — точность 0.01 мм, чтобы не тащить «шум» float
       const s = this.gridSnap ? this.snapStep() : 0.01;
       p = [Math.round(p[0] / s) * s, Math.round(p[1] / s) * s].map((v) => +v.toFixed(4)) as V2;
     }
-    this.onSketch(type, p, !!best, raw);
+    this.onSketch(type, p, !!best, raw, bestKind);
   }
 
   /** Черновик эскиза: контуры, ломаные, маркер привязки, ручки точек, опорные линии и размеры */
@@ -939,18 +1068,36 @@ export class Viewport {
       this.draftRoot.add(o);
     };
     const toV = (pts: V2[]) => pts.map(([x, y]) => new THREE.Vector3(x, y, 0));
+    // Всё в черновике рисуется без проверки глубины — эскиз виден и внутри тела
     for (const p of v.closed) {
       const pts = outline(p);
-      add(new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(toV(pts)), new THREE.LineBasicMaterial({ color: this.palette.draft })));
+      if (!isClosed(p)) {
+        add(this.openLine(pts, this.palette.draft, p.kind === "axis", true));
+        continue;
+      }
+      const loop = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(toV(pts)), new THREE.LineBasicMaterial({ color: this.palette.draft, depthTest: false }));
+      loop.renderOrder = 2;
+      add(loop);
       const fill = new THREE.Mesh(
         new THREE.ShapeGeometry(new THREE.Shape(pts.map(([x, y]) => new THREE.Vector2(x, y)))),
-        new THREE.MeshBasicMaterial({ color: 0x4c8dff, transparent: true, opacity: 0.22, side: THREE.DoubleSide, depthWrite: false }),
+        new THREE.MeshBasicMaterial({ color: 0x4c8dff, transparent: true, opacity: 0.22, side: THREE.DoubleSide, depthWrite: false, depthTest: false }),
       );
+      fill.renderOrder = 1;
       add(fill);
     }
     for (const pts of v.open) {
       if (pts.length < 2) continue;
-      add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(toV(pts)), new THREE.LineBasicMaterial({ color: 0xffb02e })));
+      const ln = new THREE.Line(new THREE.BufferGeometry().setFromPoints(toV(pts)), new THREE.LineBasicMaterial({ color: 0xffb02e, depthTest: false }));
+      ln.renderOrder = 2;
+      add(ln);
+    }
+    if (v.hover && (v.hover.lines.length || v.hover.pts.length)) {
+      const pos = v.hover.lines.flatMap((l) => l.slice(0, -1).flatMap((a, i) => [a[0], a[1], 0, l[i + 1][0], l[i + 1][1], 0]));
+      if (pos.length) {
+        const hl = new LineSegments2(new LineSegmentsGeometry().setPositions(pos), new LineMaterial({ color: 0x4fd1e8, linewidth: 4, depthTest: false }));
+        hl.renderOrder = 5;
+        add(hl);
+      }
     }
 
     // Опорные линии (рёбра тела в плоскости эскиза, оси) — для размеров «точка — грань»
@@ -972,6 +1119,7 @@ export class Viewport {
       add(pts3);
     };
     dots(v.handles ?? [], this.palette.draft, 9);
+    dots(v.hover?.pts ?? [], 0x4fd1e8, 14);
     dots(v.selected ?? [], 0xffb02e, 13);
 
     const ppu = this.pxPerUnit();
@@ -1104,6 +1252,52 @@ export class Viewport {
       }
     }
     return lines;
+  }
+
+  /**
+   * Рёбра тел, лежащие в плоскости эскиза: отрезки для привязки «на ребре», вершины,
+   * середины прямых рёбер и центры круговых — для привязки к точкам.
+   */
+  planeSnaps(): { points: V2[]; kinds: string[]; lines: [V2, V2][] } {
+    const pl = this.sketchPlane;
+    const out = { points: [] as V2[], kinds: [] as string[], lines: [] as [V2, V2][] };
+    if (!pl) return out;
+    const n = v3(pl.normal);
+    const o = v3(pl.origin);
+    const v = new THREE.Vector3();
+    for (const g of this.groups.values()) {
+      const pos = (g.children[1] as THREE.LineSegments).geometry.getAttribute("position");
+      for (const eg of g.userData.edgeGroups as { start: number; count: number }[]) {
+        const pts: V2[] = [];
+        let inPlane = true;
+        for (let i = eg.start; i < eg.start + eg.count; i++) {
+          v.fromBufferAttribute(pos, i).add(g.position);
+          if (Math.abs(v.clone().sub(o).dot(n)) > 0.05) {
+            inPlane = false;
+            break;
+          }
+          pts.push(toLocal(pl, [v.x, v.y, v.z]));
+        }
+        if (!inPlane || pts.length < 2) continue;
+        for (let i = 0; i + 1 < pts.length; i += 2) out.lines.push([pts[i], pts[i + 1]]);
+        const [a, b] = [pts[0], pts[pts.length - 1]];
+        const closedLoop = Math.hypot(a[0] - b[0], a[1] - b[1]) < 1e-6;
+        if (closedLoop) {
+          // Замкнутое круговое ребро — центр как среднее точек окружности
+          const c: V2 = [pts.reduce((s, q) => s + q[0], 0) / pts.length, pts.reduce((s, q) => s + q[1], 0) / pts.length];
+          out.points.push(c);
+          out.kinds.push("центр ребра");
+        } else {
+          out.points.push(a, b);
+          out.kinds.push("вершина тела", "вершина тела");
+          if (eg.count === 2) {
+            out.points.push([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]);
+            out.kinds.push("середина ребра");
+          }
+        }
+      }
+    }
+    return out;
   }
 
   // ---------- масштаб ----------

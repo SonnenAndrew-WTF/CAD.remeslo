@@ -455,3 +455,15 @@ button.primary:active { box-shadow: inset 3px 3px 7px rgba(0,0,0,.3); }
 .con-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 10px 0 4px; }
 .con-grid button { height: 54px; display: flex; flex-direction: column; align-items: center; justify-content: center; font-size: 10.5px; padding: 2px; }
 .con-grid .ico { font-size: 17px; line-height: 1; margin-bottom: 2px; }
+
+/* Предупреждения о пределах ядра */
+#toast.warn { color: var(--accent-2); }
+
+/* Оси X/Y/Z на кубике вида */
+.vc-axes {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  overflow: visible;
+  pointer-events: none;
+  font: 700 11px system-ui, sans-serif;
+}

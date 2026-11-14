@@ -18,7 +18,14 @@ export type Profile =
   | { kind: "circle"; cx: number; cy: number; r: number }
   | { kind: "ellipse"; cx: number; cy: number; rx: number; ry: number }
   | { kind: "slot"; a: V2; b: V2; r: number }
-  | { kind: "poly"; pts: V2[]; radii?: number[] };
+  | { kind: "poly"; pts: V2[]; radii?: number[] }
+  /** Открытая ломаная — не вытягивается, но участвует в связях и привязках */
+  | { kind: "path"; pts: V2[] }
+  /** Ось — вспомогательная линия для тел вращения и массивов */
+  | { kind: "axis"; a: V2; b: V2 };
+
+/** Замкнутый ли контур (можно вытянуть или повернуть) */
+export const isClosed = (p: Profile) => p.kind !== "path" && p.kind !== "axis";
 
 /** Размер от точки эскиза (профиль i, ручка h) до опорной линии ref (ребро тела или ось) */
 export interface RefDim {
@@ -186,6 +193,10 @@ export function outline(p: Profile): V2[] {
       const ang = Math.atan2(p.b[1] - p.a[1], p.b[0] - p.a[0]);
       return [...arc(p.b, p.r, ang - Math.PI / 2, ang + Math.PI / 2, 24), ...arc(p.a, p.r, ang + Math.PI / 2, ang + (Math.PI * 3) / 2, 24)];
     }
+    case "path":
+      return p.pts;
+    case "axis":
+      return [p.a, p.b];
   }
 }
 
@@ -197,8 +208,10 @@ export function centroid(p: Profile): V2 {
     case "rect":
       return [p.x + p.w / 2, p.y + p.h / 2];
     case "slot":
+    case "axis":
       return v2.mul(v2.add(p.a, p.b), 0.5);
-    case "poly": {
+    case "poly":
+    case "path": {
       const n = p.pts.length;
       return [p.pts.reduce((s, q) => s + q[0], 0) / n, p.pts.reduce((s, q) => s + q[1], 0) / n];
     }
@@ -216,8 +229,10 @@ export function handles(p: Profile): V2[] {
     case "ellipse":
       return [[p.cx, p.cy]];
     case "slot":
+    case "axis":
       return [p.a, p.b];
     case "poly":
+    case "path":
       return p.pts;
   }
 }
@@ -233,8 +248,10 @@ export function translateProfile(p: Profile, dx: number, dy: number): Profile {
     case "ellipse":
       return { ...p, cx: p.cx + dx, cy: p.cy + dy };
     case "slot":
+    case "axis":
       return { ...p, a: t(p.a), b: t(p.b) };
     case "poly":
+    case "path":
       return { ...p, pts: p.pts.map(t) };
   }
 }
@@ -255,8 +272,10 @@ export function moveHandle(p: Profile, h: number, q: V2): Profile {
     case "ellipse":
       return { ...p, cx: q[0], cy: q[1] };
     case "slot":
+    case "axis":
       return h === 0 ? { ...p, a: q } : { ...p, b: q };
     case "poly":
+    case "path":
       return { ...p, pts: p.pts.map((x, i) => (i === h ? q : x)) };
   }
 }
@@ -270,6 +289,7 @@ export function deleteHandle(p: Profile, h: number): Profile | null {
   if (p.kind === "poly" && p.pts.length > 3) {
     return { ...p, pts: p.pts.filter((_, i) => i !== h), radii: p.radii?.filter((_, i) => i !== h) };
   }
+  if (p.kind === "path" && p.pts.length > 2) return { ...p, pts: p.pts.filter((_, i) => i !== h) };
   return null;
 }
 
@@ -280,11 +300,35 @@ export function setCornerRadius(p: Profile, h: number | "all", r: number): Profi
   return { ...p, radii };
 }
 
+/** Отрезки профиля (стороны многоугольника/прямоугольника, звенья ломаной, ось) */
+export function segments(p: Profile): [V2, V2][] {
+  if (p.kind === "rect" || p.kind === "poly") {
+    const pts = p.kind === "poly" ? p.pts : rectCorners(p);
+    return pts.map((a, j) => [a, pts[(j + 1) % pts.length]] as [V2, V2]);
+  }
+  if (p.kind === "path") return p.pts.slice(0, -1).map((a, j) => [a, p.pts[j + 1]] as [V2, V2]);
+  if (p.kind === "axis" || p.kind === "slot") return [[p.a, p.b]];
+  return [];
+}
+
+export type SnapKind = "end" | "mid" | "center" | "quad";
+/** Точки привязки с типом: концы, середины отрезков, центры и квадранты окружностей */
+export function snapPointsTyped(p: Profile): { p: V2; k: SnapKind }[] {
+  if (p.kind === "ellipse" || p.kind === "circle") {
+    const [rx, ry] = p.kind === "circle" ? [p.r, p.r] : [p.rx, p.ry];
+    return [
+      { p: [p.cx, p.cy], k: "center" },
+      ...([[rx, 0], [-rx, 0], [0, ry], [0, -ry]] as V2[]).map(([dx, dy]) => ({ p: [p.cx + dx, p.cy + dy] as V2, k: "quad" as const })),
+    ];
+  }
+  const ends = handles(p).map((q, i) => ({ p: q, k: (p.kind === "rect" && i === 4 ? "center" : "end") as SnapKind }));
+  const mids = p.kind === "slot" ? [] : segments(p).map(([a, b]) => ({ p: v2.mul(v2.add(a, b), 0.5), k: "mid" as const }));
+  return [...ends, ...mids];
+}
+
 /** Точки, к которым прилипает курсор */
 export function snapPoints(p: Profile): V2[] {
-  if (p.kind === "ellipse") return [[p.cx, p.cy], [p.cx + p.rx, p.cy], [p.cx - p.rx, p.cy], [p.cx, p.cy + p.ry], [p.cx, p.cy - p.ry]];
-  if (p.kind === "circle") return [[p.cx, p.cy], [p.cx + p.r, p.cy], [p.cx - p.r, p.cy], [p.cx, p.cy + p.r], [p.cx, p.cy - p.r]];
-  return handles(p);
+  return snapPointsTyped(p).map((x) => x.p);
 }
 
 /** Прямоугольник по двум противоположным углам */
@@ -301,4 +345,4 @@ export function rectFromCenter(c: V2, q: V2): Profile {
 
 export const fmt = (v: number) => String(+v.toFixed(2));
 
-export const PROFILE_NAMES = { rect: "Прямоугольник", circle: "Окружность", ellipse: "Эллипс", slot: "Паз", poly: "Многоугольник" };
+export const PROFILE_NAMES = { rect: "Прямоугольник", circle: "Окружность", ellipse: "Эллипс", slot: "Паз", poly: "Многоугольник", path: "Линии", axis: "Ось" };

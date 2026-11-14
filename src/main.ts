@@ -1,6 +1,6 @@
 import "./style.css";
 import { Doc, type Body, type RefPlane, type Sketch } from "./doc";
-import { CONSTRAINTS, entityAnchor, isValidRef, lines as profileLines, pickEntity, prepareProfiles, solve, type Constraint, type ConstraintKind, type EntRef } from "./constraints";
+import { CONSTRAINTS, lines as conLines, entityAnchor, isValidRef, lines as profileLines, pickEntity, prepareProfiles, solve, type Constraint, type ConstraintKind, type EntRef } from "./constraints";
 import { Viewport, type Dim, type Pick, type PickMode, type ProfileRef, type SubSelection } from "./viewport";
 import * as K from "./kernel";
 import type { Primitive } from "./kernel";
@@ -29,7 +29,9 @@ import {
   rectFrom,
   rectFromCenter,
   setCornerRadius,
-  snapPoints,
+  isClosed,
+  segments,
+  snapPointsTyped,
   toWorld,
   translateProfile,
   type Profile,
@@ -44,7 +46,7 @@ const $ = <T extends HTMLElement>(sel: string) => document.querySelector(sel) as
 const doc = new Doc();
 const view = new Viewport($("#viewport"));
 
-type Mode = "normal" | "pickPlane" | "sketch" | "plane";
+type Mode = "normal" | "pickPlane" | "sketch" | "plane" | "pickAxis";
 let mode: Mode = "normal";
 let selection: number[] = [];
 let selProfile: ProfileRef | null = null;
@@ -65,19 +67,38 @@ function toast(msg: string, error = false) {
   toastTimer = window.setTimeout(() => (t.className = ""), error ? 4000 : 1800);
 }
 
+/** Предупреждение о пределах ядра — дольше на экране и отдельного цвета */
+function warn(msg: string) {
+  const t = $("#toast");
+  t.textContent = `⚠ ${msg}`;
+  t.className = "show warn";
+  clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => (t.className = ""), 6000);
+}
+
 function status(msg: string) {
   $("#status").textContent = msg;
 }
 
 /** Выполнить операцию ядра с перехватом ошибок OpenCascade */
+const SLOW_OP_MS = 2000;
+
 function run(label: string, fn: () => void, failHint?: string) {
+  const t0 = performance.now();
   try {
     fn();
   } catch (err) {
     console.error(err);
     toast(`${label}: операция не удалась${failHint ? ". " + failHint : ""}`, true);
+    return;
   }
+  // Медленная операция — признак того, что геометрия сложна для ядра в браузере
+  const dt = performance.now() - t0;
+  if (dt > SLOW_OP_MS) warn(`${label} заняла ${(dt / 1000).toFixed(1)} с — геометрия сложная для ядра, дальше операции будут медленнее`);
 }
+
+view.onHeavyMesh = (name, tris) =>
+  warn(`«${name}»: ${Math.round(tris / 1000)} тыс. треугольников — тело тяжёлое для планшета; упростите скругления или разбейте на части`);
 
 // ---------- выбор ----------
 function select(id: number | null) {
@@ -127,6 +148,7 @@ function selectPlane(id: number) {
 
 view.onTap = (pick: Pick) => {
   if (mode === "pickPlane") return pickPlane(pick);
+  if (mode === "pickAxis") return pickArrayAxis(pick);
   if (mode === "plane") return planeToolTap(pick);
   if (!pick) return select(null);
   if (pick.kind === "profile") return selectProfile({ sketchId: pick.sketchId, index: pick.index });
@@ -260,7 +282,12 @@ view.onScaleEnd = scaleBody;
 const arr = {
   kind: "linear" as "linear" | "circular",
   count: 3,
-  axis: "X" as "X" | "Y" | "Z",
+  /** X / Y / Z, "pick" — выбранное ребро/цилиндр, "sk:<эскиз>:<профиль>" — ось эскиза */
+  axis: "X" as string,
+  /** Ось, взятая с ребра или цилиндра */
+  picked: null as { origin: Vec3; dir: Vec3; label: string } | null,
+  /** Тело, для которого выбирается ось (чтобы вернуться к нему) */
+  forBody: null as number | null,
   step: 50,
   angle: 360,
   center: [0, 0, 0] as Vec3,
@@ -269,10 +296,58 @@ const arr = {
 const AXES: Record<"X" | "Y" | "Z", Vec3> = { X: [1, 0, 0], Y: [0, 1, 0], Z: [0, 0, 1] };
 
 /** Копии тела: по прямой с шагом или по окружности вокруг оси через центр */
+/** Ось массива: стандартная, выбранная на теле или ось эскиза (в мировых координатах) */
+function arrayAxis(): { origin: Vec3; dir: Vec3 } | null {
+  if (arr.axis === "X" || arr.axis === "Y" || arr.axis === "Z") return { origin: arr.center, dir: AXES[arr.axis] };
+  if (arr.axis === "pick") return arr.picked;
+  const [, skId, pi] = arr.axis.split(":");
+  const sk = doc.getSketch(Number(skId));
+  const p = sk?.profiles[Number(pi)];
+  if (!sk || p?.kind !== "axis") return null;
+  const a = toWorld(sk.plane, p.a);
+  const b = toWorld(sk.plane, p.b);
+  const d: Vec3 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+  const l = Math.hypot(...d);
+  return { origin: a, dir: [d[0] / l, d[1] / l, d[2] / l] };
+}
+
+function beginPickAxis(b: Body) {
+  mode = "pickAxis";
+  arr.forBody = b.id;
+  refresh();
+  status("Коснитесь ребра (прямого — вдоль него, круглого — вокруг его центра) или цилиндра");
+}
+
+function pickArrayAxis(pick: Pick) {
+  const finish = () => {
+    mode = "normal";
+    selection = arr.forBody !== null && doc.get(arr.forBody) ? [arr.forBody] : [];
+    status("");
+    refresh();
+  };
+  if (!pick) return finish();
+  try {
+    if (pick.kind === "edge") {
+      const ax = cached(doc.get(pick.id)!.shape, `ax${pick.edgeId}`, () => K.edgeAxis(doc.get(pick.id)!.shape, pick.edgeId));
+      arr.picked = { origin: ax.origin, dir: ax.dir, label: ax.kind === "circle" ? "ось круглого ребра" : "прямое ребро" };
+    } else if (pick.kind === "face") {
+      const ax = K.faceAxis(doc.get(pick.id)!.shape, pick.faceId);
+      if (!ax) return toast("Коснитесь ребра или цилиндрической грани");
+      arr.picked = { ...ax, label: "ось цилиндра" };
+    } else return toast("Коснитесь ребра или цилиндрической грани");
+  } catch (err) {
+    return warn(`${(err as Error).message} — ядро определяет оси только у прямых и круговых рёбер`);
+  }
+  arr.axis = "pick";
+  finish();
+}
+
 function applyArray(b: Body) {
   const n = Math.round(arr.count);
   if (!(n >= 2)) return toast("Количество — минимум 2", true);
-  const axis = AXES[arr.axis];
+  const ax = arrayAxis();
+  if (!ax) return toast("Выберите ось массива", true);
+  const axis = ax.dir;
   const full = Math.abs(arr.angle) >= 360 - 1e-6;
   const stepA = full ? arr.angle / n : arr.angle / (n - 1);
   run("Массив", () => {
@@ -283,7 +358,7 @@ function applyArray(b: Body) {
         const offset: Vec3 = [b.offset[0] + d[0], b.offset[1] + d[1], b.offset[2] + d[2]];
         copies.push(b.prim ? { shape: K.buildPrimitive(b.prim, offset), prim: b.prim, offset } : { shape: K.translate(b.shape, d), offset: [0, 0, 0] });
       } else {
-        copies.push({ shape: K.rotate(b.shape, stepA * k, arr.center, axis), offset: [0, 0, 0] });
+        copies.push({ shape: K.rotate(b.shape, stepA * k, ax.origin, axis), offset: [0, 0, 0] });
       }
     }
     if (arr.merge) {
@@ -314,12 +389,21 @@ function renderArraySection(root: HTMLElement, b: Body) {
       },
     ),
     numberField("Количество", arr.count, (v) => (arr.count = v)),
-    selectField("Ось", [["X", "X"], ["Y", "Y"], ["Z", "Z"]], arr.axis, (v) => (arr.axis = v as typeof arr.axis)),
+  );
+  const axisOpts: [string, string][] = [["X", "Ось X"], ["Y", "Ось Y"], ["Z", "Ось Z"]];
+  if (arr.picked) axisOpts.push(["pick", `Выбранная: ${arr.picked.label}`]);
+  for (const sk of doc.sketches) sketchAxes(sk).forEach((x, k) => axisOpts.push([`sk:${sk.id}:${x.i}`, `Ось ${k + 1} — ${sk.name}`]));
+  root.append(
+    selectField(arr.kind === "linear" ? "Направление" : "Ось вращения", axisOpts, arr.axis, (v) => {
+      arr.axis = v;
+      renderProps();
+    }),
+    buttonRow([arr.kind === "linear" ? "Вдоль ребра…" : "Ось по ребру / цилиндру…", () => beginPickAxis(b)]),
   );
   if (arr.kind === "linear") root.append(numberField("Шаг, мм", arr.step, (v) => (arr.step = v)));
   else {
     root.append(numberField("Угол всего, °", arr.angle, (v) => (arr.angle = v)));
-    (["X", "Y", "Z"] as const).forEach((a, i) => root.append(numberField(`Центр оси ${a}`, arr.center[i], (v) => (arr.center[i] = v))));
+    if (["X", "Y", "Z"].includes(arr.axis)) (["X", "Y", "Z"] as const).forEach((a, i) => root.append(numberField(`Центр оси ${a}`, arr.center[i], (v) => (arr.center[i] = v))));
   }
   root.append(
     selectField("Результат", [["sep", "Отдельные тела"], ["merge", "Одно тело"]], arr.merge ? "merge" : "sep", (v) => (arr.merge = v === "merge")),
@@ -355,6 +439,18 @@ function copyBodies(ids: number[]) {
   selProfile = null;
   sub = null;
   doc.replace(copies);
+}
+
+function renameBody(id: number) {
+  const b = doc.get(id);
+  const v = b && prompt("Название тела", b.name)?.trim();
+  if (b && v && v !== b.name) doc.replace([{ ...b, name: v }]);
+}
+
+function renameSketch(id: number) {
+  const sk = doc.getSketch(id);
+  const v = sk && prompt("Название эскиза", sk.name)?.trim();
+  if (sk && v && v !== sk.name) doc.change({ sketches: [{ ...sk, name: v }] });
 }
 
 function deleteBodies(ids: number[]) {
@@ -434,7 +530,7 @@ function exportFile(fmt: "stl" | "step") {
 }
 
 // ---------- эскиз ----------
-type Tool = "select" | "line" | "rect" | "crect" | "circle" | "ellipse" | "slot" | "dim" | "constraint";
+type Tool = "select" | "line" | "rect" | "crect" | "circle" | "ellipse" | "slot" | "axis" | "dim" | "constraint";
 type HandleRef = { i: number; h: number };
 interface Draft {
   sketchId?: number;
@@ -457,6 +553,14 @@ interface Draft {
   poly: V2[];
   cursor: V2 | null;
   cursorHot: boolean;
+  /** Что сработало при привязке курсора (для строки состояния) */
+  snapKind: string | null;
+  /** Элемент под курсором — подсвечивается */
+  hoverEnt: { pts: V2[]; lines: V2[][] } | null;
+  /** Ортогональный режим: отрезки строго горизонтально/вертикально */
+  ortho: boolean;
+  /** Привязки к телу в плоскости эскиза (считаются один раз) */
+  bodySnaps: { points: V2[]; kinds: string[]; lines: [V2, V2][] };
   /** Выбранная точка (инструмент «Точки») */
   sel: HandleRef | null;
   drag: (HandleRef & { orig: Profile }) | null;
@@ -471,12 +575,13 @@ let draft: Draft | null = null;
 
 const TOOLS: { id: Tool; ico: string; label: string; hint: string }[] = [
   { id: "select", ico: "⬚", label: "Точки", hint: "Тяните точку, чтобы переместить её. Касание точки — выбор: её можно удалить или скруглить угол." },
-  { id: "line", ico: "╱", label: "Линия", hint: "Касайтесь точек по очереди. Коснитесь первой точки, чтобы замкнуть контур." },
+  { id: "line", ico: "╱", label: "Линия", hint: "Касайтесь точек по очереди. Коснитесь первой точки, чтобы замкнуть контур. Незамкнутые линии сохраняются при смене инструмента." },
   { id: "rect", ico: "▭", label: "Прямоуг.", hint: "Проведите от угла до угла (или два касания)." },
   { id: "crect", ico: "⊡", label: "Из центра", hint: "Проведите от центра до угла (или два касания)." },
   { id: "circle", ico: "◯", label: "Круг", hint: "Проведите от центра до края (или два касания)." },
   { id: "ellipse", ico: "⬭", label: "Эллипс", hint: "Проведите от центра до угла описанного прямоугольника." },
   { id: "slot", ico: "⊂⊃", label: "Паз", hint: "Проведите осевую линию паза, затем отведите палец, задавая ширину, и коснитесь." },
+  { id: "axis", ico: "┆", label: "Ось", hint: "Проведите ось (или два касания). Ось нужна для тел вращения и массивов по кругу." },
   { id: "constraint", ico: "∥", label: "Связи", hint: "Выберите тип связи и коснитесь двух элементов эскиза." },
   { id: "dim", ico: "↔", label: "Размер", hint: "Коснитесь точки эскиза, затем ребра тела или оси (зелёные линии) — появится размер. Коснитесь размера, чтобы задать расстояние." },
 ];
@@ -515,6 +620,10 @@ function startSketch(plane: SketchPlane, hostBodyId?: number, existing?: Sketch)
     constraints: existing?.constraints ? [...existing.constraints] : [],
     conKind: "parallel",
     conFirst: null,
+    snapKind: null,
+    hoverEnt: null,
+    ortho: draft?.ortho ?? false,
+    bodySnaps: { points: [], kinds: [], lines: [] },
     refLines: view.refLines(),
     tool: "rect",
     start: null,
@@ -527,16 +636,24 @@ function startSketch(plane: SketchPlane, hostBodyId?: number, existing?: Sketch)
     drag: null,
     dimFirst: null,
   };
+  // Вершины и рёбра тела в плоскости эскиза — для привязки (после sync: тела уже в сцене)
   refresh();
+  draft.bodySnaps = view.planeSnaps();
   status("Эскиз: рисуйте пальцем или стилусом");
   drawDraft();
 }
 
+/** Незаконченная ломаная становится отдельным элементом «Линии» */
+function keepOpenPoly(d: Draft) {
+  if (d.poly.length >= 2) d.profiles.push({ kind: "path", pts: d.poly });
+  d.poly = [];
+}
+
 function setTool(t: Tool) {
   const d = draft!;
+  if (t !== "line") keepOpenPoly(d);
   d.tool = t;
   d.start = d.slotLine = d.sel = d.dimFirst = d.conFirst = null;
-  if (t !== "line") d.poly = [];
   renderProps();
   drawDraft();
 }
@@ -577,6 +694,7 @@ const isValid = (p: Profile) =>
   : p.kind === "circle" ? p.r > 0
   : p.kind === "ellipse" ? p.rx > 0 && p.ry > 0
   : p.kind === "slot" ? p.r > 0 && dist2(p.a, p.b) > 0
+  : p.kind === "axis" ? dist2(p.a, p.b) > 0
   : true;
 
 /** Профиль, который сейчас «тянется» пальцем (для предпросмотра и размеров) */
@@ -598,6 +716,8 @@ function pendingProfile(d: Draft): Profile | null {
       return { kind: "circle", cx: s[0], cy: s[1], r: dist2(s, c) };
     case "ellipse":
       return { kind: "ellipse", cx: s[0], cy: s[1], rx: Math.abs(c[0] - s[0]), ry: Math.abs(c[1] - s[1]) };
+    case "axis":
+      return { kind: "axis", a: s, b: c };
     default:
       return null;
   }
@@ -820,13 +940,23 @@ function drawDraft() {
     handles: showHandles ? d.profiles.flatMap((p) => handles(p)) : [],
     selected: hl,
     refLines: d.tool === "dim" ? d.refLines : [],
+    hover: d.hoverEnt ?? undefined,
   });
   // Перетаскиваемый профиль не должен прилипать сам к себе
   const snapFrom = d.profiles.filter((_, i) => i !== d.drag?.i);
-  view.setSnapTargets([[0, 0], ...snapFrom.flatMap(snapPoints), ...d.poly]);
+  const SNAP_NAMES = { end: "конец", mid: "середина", center: "центр", quad: "квадрант" } as const;
+  const typed = snapFrom.flatMap(snapPointsTyped);
+  const curves = snapFrom.flatMap((q) => (q.kind === "circle" || q.kind === "ellipse" || q.kind === "slot" ? [outline(q)] : []));
+  const curveSegs = curves.flatMap((o) => o.map((a, i) => [a, o[(i + 1) % o.length]] as [V2, V2]));
+  view.setSnapTargets(
+    [[0, 0], ...typed.map((t) => t.p), ...d.poly, ...d.bodySnaps.points],
+    ["начало координат", ...typed.map((t) => SNAP_NAMES[t.k]), ...d.poly.map(() => "точка линии"), ...d.bodySnaps.kinds],
+    [...snapFrom.flatMap(segments), ...curveSegs, ...d.bodySnaps.lines],
+  );
 
   // Живые размеры в строке состояния
   if (d.tool === "dim" && d.dimFirst) status("Теперь коснитесь ребра тела или оси (зелёные линии)");
+  else if (d.snapKind && d.cursor && !pend) status(`Привязка: ${d.snapKind} · X ${fmt(d.cursor[0])} Y ${fmt(d.cursor[1])}`);
   else if (pend?.kind === "rect") status(`Прямоугольник ${fmt(pend.w)} × ${fmt(pend.h)} мм`);
   else if (pend?.kind === "circle") status(`Окружность R ${fmt(pend.r)} мм (Ø ${fmt(pend.r * 2)})`);
   else if (pend?.kind === "ellipse") status(`Эллипс ${fmt(pend.rx * 2)} × ${fmt(pend.ry * 2)} мм`);
@@ -835,11 +965,46 @@ function drawDraft() {
   else if (d.cursor) status(`X ${fmt(d.cursor[0])}  Y ${fmt(d.cursor[1])}`);
 }
 
-view.onSketch = (type, p, hot, raw) => {
+/** Элемент эскиза под курсором: точка, отрезок или кривая (окружность, эллипс, паз) */
+function entityUnder(d: Draft, raw: V2): { pts: V2[]; lines: V2[][] } | null {
+  const tol = 14 / view.pxPerUnit();
+  const h = nearestHandle(d, raw, 14);
+  if (h) return { pts: [handles(d.profiles[h.i])[h.h]], lines: [] };
+  let best: V2[] | null = null;
+  let bestD = tol;
+  for (const p of d.profiles) {
+    if (p.kind === "circle" || p.kind === "ellipse" || p.kind === "slot") {
+      const o = outline(p);
+      const loop = [...o, o[0]];
+      for (let i = 0; i + 1 < loop.length; i++) {
+        const dd = dist2(raw, closestOnSegment(raw, loop[i], loop[i + 1]));
+        if (dd < bestD) [best, bestD] = [loop, dd];
+      }
+    } else {
+      for (const [a, b] of conLines(p)) {
+        const dd = dist2(raw, closestOnSegment(raw, a, b));
+        if (dd < bestD) [best, bestD] = [[a, b], dd];
+      }
+    }
+  }
+  return best ? { pts: [], lines: [best] } : null;
+}
+
+/** Ортогональный режим: от предыдущей точки — строго по горизонтали или вертикали */
+function orthoSnap(d: Draft, p: V2): V2 {
+  const anchor = d.tool === "line" ? d.poly[d.poly.length - 1] : (d.tool === "axis" || d.tool === "slot") && !d.slotLine ? d.start : null;
+  if (!d.ortho || !anchor) return p;
+  return Math.abs(p[0] - anchor[0]) >= Math.abs(p[1] - anchor[1]) ? [p[0], anchor[1]] : [anchor[0], p[1]];
+}
+
+view.onSketch = (type, p0, hot, raw, snap) => {
   const d = draft;
   if (!d) return;
+  const p = orthoSnap(d, p0);
   d.cursor = p;
   d.cursorHot = hot;
+  d.snapKind = snap;
+  d.hoverEnt = type === "hover" || type === "move" ? (d.drag ? null : entityUnder(d, raw)) : null;
   if (type === "cancel") {
     if (d.drag) d.profiles[d.drag.i] = d.drag.orig;
     d.drag = null;
@@ -953,7 +1118,7 @@ function closePoly() {
 
 function finishSketch() {
   const d = draft!;
-  if (d.poly.length >= 3) d.profiles.push({ kind: "poly", pts: d.poly });
+  keepOpenPoly(d);
   exitSketchMode();
   if (!d.profiles.length) {
     if (d.sketchId) doc.change({ removeSketches: [d.sketchId] });
@@ -1000,6 +1165,11 @@ function deleteProfile(ref: ProfileRef) {
 
 // ---------- вытягивание ----------
 interface ExtrudeOpts {
+  /** Вытягивание или тело вращения вокруг оси эскиза */
+  op?: "extrude" | "revolve";
+  angle?: number;
+  /** Номер оси (профиля kind:"axis") в эскизе */
+  axisIndex?: number;
   distance: number;
   /** В обе стороны от плоскости эскиза на distance */
   symmetric?: boolean;
@@ -1015,6 +1185,30 @@ function extrudeCtx() {
   const sk = doc.getSketch(selProfile.sketchId);
   const prof = sk?.profiles[selProfile.index];
   return sk && prof ? { sk, prof } : null;
+}
+
+/** Оси эскиза (для вращения) */
+function sketchAxes(sk: Sketch) {
+  return sk.profiles.map((p, i) => ({ p, i })).filter((x): x is { p: Extract<Profile, { kind: "axis" }>; i: number } => x.p.kind === "axis");
+}
+
+/**
+ * Ось не должна пересекать профиль: ядро тогда строит самопересекающееся тело
+ * (это ограничение OpenCascade) — проверяем заранее.
+ */
+function axisCrossesProfile(prof: Profile, a: V2, b: V2): boolean {
+  const side = (q: V2) => (b[0] - a[0]) * (q[1] - a[1]) - (b[1] - a[1]) * (q[0] - a[0]);
+  const signs = outline(prof).map(side);
+  const eps = 1e-6;
+  return signs.some((v) => v > eps) && signs.some((v) => v < -eps);
+}
+
+function revolveShape(sk: Sketch, prof: Profile): K.Shape {
+  const axes = sketchAxes(sk);
+  const ax = axes.find((x) => x.i === ex.axisIndex) ?? axes[0];
+  if (!ax) throw new Error("В эскизе нет оси");
+  if (axisCrossesProfile(prof, ax.p.a, ax.p.b)) throw new Error("Ось пересекает профиль");
+  return K.revolveProfile(sk.plane, prof, ax.p.a, ax.p.b, ex.angle ?? 360);
 }
 
 /** Во что превратится вытягивание: новое тело, добавление к телу или вырез */
@@ -1034,13 +1228,24 @@ function resolveOp(sk: Sketch): { kind: "new" | "add" | "cut"; target?: Body } {
 const OP_TEXT = { new: "Новое тело", add: "Добавить к", cut: "Вырезать из" };
 
 let previewQueued = false;
+let lastPreview = 0;
+const HEAVY_PREVIEW_MS = 90;
+
 function schedulePreview() {
   if (previewQueued) return;
   previewQueued = true;
-  requestAnimationFrame(() => {
-    previewQueued = false;
-    updatePreview();
-  });
+  // Скругление и вращение в ядре дороже вытягивания — пересчитываем реже
+  const heavy = !!edgeCtx() || !!faceCtx() || ex.op === "revolve";
+  const wait = heavy ? Math.max(0, HEAVY_PREVIEW_MS - (performance.now() - lastPreview)) : 0;
+  setTimeout(
+    () =>
+      requestAnimationFrame(() => {
+        previewQueued = false;
+        lastPreview = performance.now();
+        updatePreview();
+      }),
+    wait,
+  );
 }
 
 function updatePreview() {
@@ -1055,6 +1260,19 @@ function updatePreview() {
   if (opBox) {
     opBox.className = `op ${op.kind}`;
     opBox.textContent = `→ ${OP_TEXT[op.kind]}${op.target ? " «" + op.target.name + "»" : ""}`;
+  }
+  if (!isClosed(ctx.prof)) return view.setPreview(null);
+  if (ex.op === "revolve") {
+    try {
+      view.setPreview(revolveShape(ctx.sk, ctx.prof), op.kind === "cut" ? 0xff5d5d : 0x5dd39e);
+    } catch (err) {
+      view.setPreview(null);
+      if (opBox) {
+        opBox.className = "op cut";
+        opBox.textContent = (err as Error).message === "Ось пересекает профиль" ? "⚠ Ось пересекает профиль — ядро не построит такое тело. Отодвиньте ось или профиль." : `⚠ ${(err as Error).message}`;
+      }
+    }
+    return;
   }
   if (Math.abs(ex.distance) < 1e-6) return view.setPreview(null);
   try {
@@ -1092,6 +1310,12 @@ function syncExtrude() {
     view.setPreview(null);
     return;
   }
+  // Для вращения и незамкнутых элементов стрелка не нужна
+  if (ex.op === "revolve" || !isClosed(ctx.prof)) {
+    view.hideExtrudeHandle();
+    schedulePreview();
+    return;
+  }
   const origin = toWorld(ctx.sk.plane, centroid(ctx.prof));
   view.showExtrudeHandle(origin, ctx.sk.plane.normal, ex.distance, (d) => {
     ex.distance = Math.round(d * 100) / 100;
@@ -1103,14 +1327,22 @@ function syncExtrude() {
 function applyExtrude() {
   const ctx = extrudeCtx();
   if (!ctx) return;
-  if (Math.abs(ex.distance) < 1e-6) return toast("Расстояние не может быть нулевым");
+  if (!isClosed(ctx.prof)) return toast("Это не замкнутый контур — его нельзя вытянуть или повернуть", true);
+  const revolve = ex.op === "revolve";
+  if (!revolve && Math.abs(ex.distance) < 1e-6) return toast("Расстояние не может быть нулевым");
+  if (revolve) {
+    const ax = sketchAxes(ctx.sk);
+    if (!ax.length) return toast("Добавьте в эскиз ось (инструмент «Ось»)", true);
+    const a = ax.find((x) => x.i === ex.axisIndex) ?? ax[0];
+    if (axisCrossesProfile(ctx.prof, a.p.a, a.p.b)) return warn("Ось пересекает профиль — OpenCascade не строит самопересекающиеся тела вращения. Отодвиньте ось.");
+  }
   const op = resolveOp(ctx.sk);
-  run("Вытягивание", () => {
-    const tool = K.extrudeProfile(ctx.sk.plane, ctx.prof, ex.distance, ex.symmetric);
+  run(revolve ? "Вращение" : "Вытягивание", () => {
+    const tool = revolve ? revolveShape(ctx.sk, ctx.prof) : K.extrudeProfile(ctx.sk.plane, ctx.prof, ex.distance, ex.symmetric);
     let result: Body;
     if (op.kind === "new" || !op.target) {
       result = doc.newBody({ shape: tool, offset: [0, 0, 0] });
-      result.name = `Вытягивание ${result.id}`;
+      result.name = `${revolve ? "Вращение" : "Вытягивание"} ${result.id}`;
     } else {
       const shape = op.kind === "add" ? K.union(op.target.shape, tool) : K.subtract(op.target.shape, tool);
       result = { ...op.target, shape, prim: undefined };
@@ -1128,10 +1360,23 @@ let edgeKind: "fillet" | "chamfer" = "fillet";
 let shellThickness = 2;
 
 /** Выбраны только рёбра — доступно скругление/фаска со стрелкой */
+/**
+ * Запросы к ядру о гранях/рёбрах (нормали, середины) вызываются на каждое обновление
+ * интерфейса — кэшируем по фигуре: фигуры неизменяемы, id граней в них стабильны.
+ */
+const frameCache = new WeakMap<K.Shape, Map<string, unknown>>();
+function cached<T>(shape: K.Shape, key: string, fn: () => T): T {
+  let m = frameCache.get(shape);
+  if (!m) frameCache.set(shape, (m = new Map()));
+  if (!m.has(key)) m.set(key, fn());
+  return m.get(key) as T;
+}
+
 function edgeCtx() {
   if (mode !== "normal" || !sub || !sub.edges.length || sub.faces.length) return null;
   try {
-    return { body: sub.body, edges: sub.edges, frame: K.edgeFrame(sub.body.shape, sub.edges[0]) };
+    const frame = cached(sub.body.shape, `e${sub.edges[0]}`, () => K.edgeFrame(sub!.body.shape, sub!.edges[0]));
+    return { body: sub.body, edges: sub.edges, frame };
   } catch {
     return null;
   }
@@ -1160,7 +1405,7 @@ function updateEdgePreview(e: NonNullable<ReturnType<typeof edgeCtx>>) {
 function faceCtx() {
   if (mode !== "normal" || !sub || sub.faces.length !== 1 || sub.edges.length) return null;
   try {
-    const frame = K.faceFrame(sub.body.shape, sub.faces[0]);
+    const frame = cached(sub.body.shape, `f${sub.faces[0]}`, () => K.faceFrame(sub!.body.shape, sub!.faces[0]));
     return frame.planar ? { body: sub.body, faceId: sub.faces[0], frame } : null;
   } catch {
     return null;
@@ -1479,6 +1724,7 @@ window.addEventListener("keydown", (e) => {
   }
   if (mode === "sketch") {
     if (mod && k === "z") stepBack();
+    else if (k === "o") toggleOrtho();
     else if ((k === "delete" || k === "backspace") && draft?.sel) deleteSelectedPoint();
     else if (k === "escape") draft?.start || draft?.poly.length ? stepBack() : cancelSketch();
     else if (k === "enter") finishSketch();
@@ -1486,6 +1732,10 @@ window.addEventListener("keydown", (e) => {
   }
   if (mode === "pickPlane") {
     if (k === "escape") cancelSketch();
+    return;
+  }
+  if (mode === "pickAxis") {
+    if (k === "escape") pickArrayAxis(null);
     return;
   }
   if (mode === "plane") {
@@ -1621,6 +1871,15 @@ function profileFields(p: Profile, update: (p: Profile) => void): HTMLElement[] 
       ];
     case "poly":
       return [el("div", { className: "hint", textContent: `${p.pts.length} точек` }), cornerField(p)];
+    case "path":
+      return [el("div", { className: "hint", textContent: `Незамкнутые линии: ${p.pts.length - 1} отр. Не вытягиваются — замкните контур инструментом «Линия».` })];
+    case "axis":
+      return [
+        numberField("X1", p.a[0], (v) => update({ ...p, a: [v, p.a[1]] })),
+        numberField("Y1", p.a[1], (v) => update({ ...p, a: [p.a[0], v] })),
+        numberField("X2", p.b[0], (v) => update({ ...p, b: [v, p.b[1]] })),
+        numberField("Y2", p.b[1], (v) => update({ ...p, b: [p.b[0], v] })),
+      ];
   }
 }
 
@@ -1651,6 +1910,13 @@ function renderPointSection(root: HTMLElement, d: Draft) {
     );
     if (corners(p).length && cur > 0) root.append(buttonRow(["Убрать скругление", () => set(setCornerRadius(p, h, 0))]));
   }
+}
+
+function toggleOrtho() {
+  if (!draft) return;
+  draft.ortho = !draft.ortho;
+  toast(draft.ortho ? "Ортогональный режим включён" : "Ортогональный режим выключен");
+  renderProps();
 }
 
 function renderConstraintSection(root: HTMLElement, d: Draft) {
@@ -1689,6 +1955,9 @@ function renderSketchPanel(root: HTMLElement) {
     tools.append(b);
   }
   root.append(el("h3", { textContent: "Эскиз" }), tools, el("p", { className: "hint", textContent: TOOLS.find((t) => t.id === d.tool)!.hint }));
+  const orthoBtn = el("button", { className: d.ortho ? "on" : "", textContent: "⊾ Орто", title: "Ортогональный режим (O): отрезки строго по горизонтали/вертикали" });
+  orthoBtn.addEventListener("click", () => toggleOrtho());
+  root.append(el("div", { className: "row" }, orthoBtn));
   if (d.tool === "line") root.append(buttonRow(["Замкнуть", closePoly], ["↶ Шаг назад", stepBack]));
   else if (d.tool !== "select" && d.tool !== "dim") root.append(buttonRow(["↶ Шаг назад", stepBack]));
   if (d.tool === "dim" && d.refDims.length) {
@@ -1729,6 +1998,25 @@ function renderSketchPanel(root: HTMLElement) {
 }
 
 function renderExtrudePanel(root: HTMLElement, sk: Sketch, prof: Profile) {
+  if (!isClosed(prof)) {
+    root.append(
+      el("h3", { textContent: `${PROFILE_NAMES[prof.kind]} — эскиз «${sk.name}»` }),
+      el("p", { className: "hint", textContent: prof.kind === "axis" ? "Ось эскиза: используется для тел вращения и массивов по кругу (выберите её в разделе «Массив» тела)." : "Незамкнутые линии нельзя вытянуть. Замкните контур в эскизе инструментом «Линия»." }),
+      buttonRow(["Изменить эскиз", () => startSketch(sk.plane, sk.hostBodyId, sk)], ["Удалить", () => deleteProfile(selProfile!)]),
+    );
+    return;
+  }
+  root.append(
+    segmented(
+      [["extrude", "Вытягивание"], ["revolve", "Вращение"]],
+      ex.op ?? "extrude",
+      (v) => {
+        ex.op = v as "extrude" | "revolve";
+        refresh();
+      },
+    ),
+  );
+  if (ex.op === "revolve") return renderRevolvePanel(root, sk, prof);
   root.append(
     el("h3", { textContent: `Вытягивание — ${PROFILE_NAMES[prof.kind].toLowerCase()}` }),
     el("p", { className: "hint", textContent: "Тяните стрелку или введите расстояние. Отрицательное — в другую сторону." }),
@@ -1783,6 +2071,44 @@ function renderExtrudePanel(root: HTMLElement, sk: Sketch, prof: Profile) {
       ["Удалить", () => deleteProfile(selProfile!)],
     ),
   );
+}
+
+function renderRevolvePanel(root: HTMLElement, sk: Sketch, prof: Profile) {
+  const axes = sketchAxes(sk);
+  root.append(el("h3", { textContent: `Вращение — ${PROFILE_NAMES[prof.kind].toLowerCase()}` }));
+  if (!axes.length) {
+    root.append(
+      el("p", { className: "hint", textContent: "В эскизе нет оси. Откройте эскиз и проведите её инструментом «Ось» сбоку от профиля." }),
+      buttonRow(["Изменить эскиз", () => startSketch(sk.plane, sk.hostBodyId, sk), "primary"]),
+    );
+    return;
+  }
+  if (axes.length > 1) {
+    root.append(
+      selectField(
+        "Ось",
+        axes.map((x, k) => [String(x.i), `Ось ${k + 1}`] as [string, string]),
+        String(axes.find((x) => x.i === ex.axisIndex)?.i ?? axes[0].i),
+        (v) => {
+          ex.axisIndex = Number(v);
+          schedulePreview();
+        },
+      ),
+    );
+  }
+  root.append(
+    numberField("Угол, °", ex.angle ?? 360, (v) => {
+      if (!(v > 0 && v <= 360)) return toast("Угол — от 0 до 360°", true);
+      ex.angle = v;
+      schedulePreview();
+    }),
+  );
+  const modeSel = selectField("Режим", [["auto", "Авто"], ["new", "Новое тело"], ["add", "Добавить к телу"], ["cut", "Вырезать из тела"]], ex.mode, (v) => {
+    ex.mode = v as ExtrudeOpts["mode"];
+    schedulePreview();
+  });
+  opBox = el("div", { className: "op" });
+  root.append(modeSel, opBox, buttonRow(["Повернуть", applyExtrude, "primary"]), buttonRow(["Изменить эскиз", () => startSketch(sk.plane, sk.hostBodyId, sk)]));
 }
 
 function renderBodyPanel(root: HTMLElement, b: Body) {
@@ -1849,6 +2175,14 @@ function renderProps() {
   const ctx = extrudeCtx();
   if (ctx) return renderExtrudePanel(root, ctx.sk, ctx.prof);
   if (mode === "plane") return renderPlaneTool(root);
+  if (mode === "pickAxis") {
+    root.append(
+      el("h3", { textContent: "Ось массива" }),
+      el("p", { className: "hint", textContent: "Коснитесь прямого ребра (массив вдоль него / вокруг него) или круглого ребра цилиндра (вокруг его оси). Касание пустого места — отмена." }),
+      buttonRow(["Отмена", () => pickArrayAxis(null)]),
+    );
+    return;
+  }
   if (sub) return renderSubPanel(root, sub);
   const rp = selPlane !== null ? doc.getPlane(selPlane) : undefined;
   if (rp) return renderPlanePanel(root, rp);
@@ -1996,6 +2330,7 @@ function renderTree() {
     if (b.hidden) li.append(el("span", { className: "flag", textContent: "◌", title: "Скрыто" }));
     li.append(
       rowMenuButton(() => [
+        ["Переименовать", () => renameBody(b.id)],
         ["Копировать", () => copyBodies([b.id])],
         [b.hidden ? "Показать" : "Скрыть", () => setBodyFlag([b.id], "hidden", !b.hidden)],
         [b.locked ? "Разблокировать" : "Заблокировать", () => setBodyFlag([b.id], "locked", !b.locked)],
@@ -2039,9 +2374,18 @@ function renderTree() {
       "li",
       { className: selProfile?.sketchId === sk.id ? "sel" : "" },
       el("span", { className: "swatch", style: "border:2px solid #9fc0ff" }),
-      el("span", { textContent: `${sk.name} · ${sk.profiles.length}` }),
+      el("span", { className: "name", textContent: `${sk.name} · ${sk.profiles.length}` }),
+      rowMenuButton(() => [
+        ["Переименовать", () => renameSketch(sk.id)],
+        ["Изменить эскиз", () => startSketch(sk.plane, sk.hostBodyId, sk)],
+        ["Удалить", () => doc.change({ removeSketches: [sk.id] }), "danger"],
+      ]),
     );
-    li.addEventListener("click", () => selectProfile({ sketchId: sk.id, index: 0 }));
+    li.addEventListener("click", () => {
+      // Сначала замкнутый профиль: оси и линии вытянуть нельзя
+      const i = sk.profiles.findIndex(isClosed);
+      selectProfile({ sketchId: sk.id, index: Math.max(0, i) });
+    });
     sl.append(li);
   }
 }
@@ -2054,9 +2398,10 @@ function refresh() {
   // id граней/рёбер относятся к конкретной версии тела (после undo/операции — сброс)
   if (sub && doc.get(sub.bodyId) !== sub.body) sub = null;
   $("#app").classList.toggle("sketching", mode !== "normal");
-  const toolPick = mode === "plane" ? planeToolPickMode() : null;
+  const toolPick = mode === "plane" ? planeToolPickMode() : mode === "pickAxis" ? "edge" : null;
   view.pickMode = toolPick ?? (mode === "pickPlane" ? "face" : pickMode);
-  view.lockedPickable = mode === "pickPlane" || mode === "plane";
+  view.lockedPickable = mode === "pickPlane" || mode === "plane" || mode === "pickAxis";
+  view.hoverBody = mode === "normal" && pickMode === "body";
   // Подсветка под курсором: плоские грани при выборе плоскости, иначе — по режиму выбора
   const hoverPick = toolPick ?? (mode === "pickPlane" ? "face" : mode === "normal" ? pickMode : "body");
   view.hoverMode = hoverPick === "face" || hoverPick === "edge" ? hoverPick : null;

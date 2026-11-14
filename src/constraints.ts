@@ -1,7 +1,7 @@
 // Геометрические связи эскиза и простой итеративный решатель.
 // Каждая связь «проецирует» один из элементов так, чтобы условие выполнялось;
 // несколько проходов по всем связям сходятся для типичных эскизов.
-import { closestOnSegment, dist2, footOnLine, handles, moveHandle, type Profile, type V2 } from "./sketch";
+import { closestOnSegment, dist2, footOnLine, handles, moveHandle, segments, type Profile, type V2 } from "./sketch";
 
 export type EntKind = "pt" | "line" | "circle";
 /** Элемент эскиза: профиль i, номер элемента e (точка-ручка, сторона или окружность) */
@@ -11,7 +11,7 @@ export interface EntRef {
   t: EntKind;
 }
 
-export type ConstraintKind = "parallel" | "collinear" | "tangent" | "coincident" | "onLine";
+export type ConstraintKind = "parallel" | "perpendicular" | "collinear" | "tangent" | "coincident" | "onLine";
 export interface Constraint {
   kind: ConstraintKind;
   a: EntRef;
@@ -20,6 +20,7 @@ export interface Constraint {
 
 export const CONSTRAINTS: { kind: ConstraintKind; label: string; glyph: string; hint: string; first: EntKind[]; second: EntKind[] }[] = [
   { kind: "parallel", label: "Параллельно", glyph: "∥", hint: "Коснитесь двух отрезков — второй повернётся параллельно первому", first: ["line"], second: ["line"] },
+  { kind: "perpendicular", label: "Перпендикулярно", glyph: "⊥", hint: "Коснитесь двух отрезков — второй повернётся под прямым углом к первому", first: ["line"], second: ["line"] },
   { kind: "collinear", label: "На одной прямой", glyph: "≡", hint: "Коснитесь двух отрезков — второй встанет на прямую первого", first: ["line"], second: ["line"] },
   { kind: "tangent", label: "Касание", glyph: "◠", hint: "Коснитесь окружности и отрезка — окружность сдвинется до касания (или двух окружностей)", first: ["circle", "line"], second: ["circle", "line"] },
   { kind: "coincident", label: "Совпадение", glyph: "●", hint: "Коснитесь двух точек — вторая переместится в первую", first: ["pt"], second: ["pt"] },
@@ -37,13 +38,9 @@ const perp = (a: V2): V2 => [-a[1], a[0]];
 
 // ---------- элементы профилей ----------
 
-/** Стороны профиля как отрезки (у многоугольника и прямоугольника) */
+/** Отрезки, к которым применимы связи: стороны, звенья ломаной, ось (осевая паза — нет) */
 export function lines(p: Profile): [V2, V2][] {
-  if (p.kind === "poly" || p.kind === "rect") {
-    const pts = p.kind === "poly" ? p.pts : handles(p).slice(0, 4);
-    return pts.map((a, j) => [a, pts[(j + 1) % pts.length]] as [V2, V2]);
-  }
-  return [];
+  return p.kind === "slot" ? [] : segments(p);
 }
 
 function circleOf(p: Profile): { c: V2; r: number } | null {
@@ -56,7 +53,8 @@ export function toPoly(p: Profile): Profile {
 }
 
 function setLine(p: Profile, e: number, a: V2, b: V2): Profile {
-  if (p.kind !== "poly") return p;
+  if (p.kind === "axis") return { ...p, a, b };
+  if (p.kind !== "poly" && p.kind !== "path") return p;
   const pts = [...p.pts];
   pts[e] = a;
   pts[(e + 1) % pts.length] = b;
@@ -161,9 +159,11 @@ function applyOne(ps: Profile[], c: Constraint, fixed: Fixed): number {
       break;
     }
     case "parallel":
+    case "perpendicular":
     case "collinear": {
       const [ra, rb] = lines(R)[ref.e];
-      const dir = norm(sub(rb, ra));
+      const along = norm(sub(rb, ra));
+      const dir = c.kind === "perpendicular" ? perp(along) : along;
       let seg = alignLine(lines(P)[mov.e], dir);
       if (c.kind === "collinear") {
         const m = mul(add(seg[0], seg[1]), 0.5);
