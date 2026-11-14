@@ -18,6 +18,9 @@ const GESTURE_MOVE = 14; // px — допустимое смещение пал�
 const SNAP_RADIUS = 16; // px — радиус прилипания к точкам эскиза
 const SNAP_STEPS = [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100];
 const EDGE_PICK_PX = 16; // px — насколько близко к ребру нужно коснуться
+const AUTO_EDGE_PX = 11; // px — в режиме «Авто» ребро выбирается, только если касание совсем рядом
+const LONG_PRESS_MS = 550; // ms — удержание пера/пальца на месте
+const LONG_PRESS_MOVE = 10; // px
 const HL_COLOR = 0xffb02e;
 const HOVER_COLOR = 0x5dd39e;
 const VIEW_ANIM_MS = 350;
@@ -26,7 +29,8 @@ const ISO_DIR: Vec3 = [0.5, -0.68, 0.53];
 /** Больше стольких треугольников — тело тяжело отрисовывать и выбирать на планшете */
 const HEAVY_TRIANGLES = 400_000;
 
-export type PickMode = "body" | "face" | "edge" | "vertex";
+/** auto — без режимов: у ребра выбирается ребро, иначе грань (тело — двойным касанием) */
+export type PickMode = "auto" | "body" | "face" | "edge" | "vertex";
 export type Projection = "persp" | "ortho";
 
 export type Pick =
@@ -144,7 +148,15 @@ export class Viewport {
   /** Что выбирает касание по телу: тело целиком, грань или ребро */
   pickMode: PickMode = "body";
   /** Подсветка под курсором/стилусом (мышь, перо): грани, рёбра или ничего */
-  hoverMode: "face" | "edge" | null = null;
+  hoverMode: "face" | "edge" | "auto" | null = null;
+  /** Удержание пера/пальца на месте (вне эскиза) — например, эскиз на грани */
+  onLongPress: (pick: Pick) => void = () => {};
+  /** Касание подписи значения у стрелки — ввод числа */
+  onHandleEdit: (label: HTMLElement, value: number) => void = () => {};
+  private handleLabel: HTMLButtonElement | null = null;
+  private handleFormat: ((d: number) => string) | null = null;
+  private handleDist = 0;
+  private dragLabel: HTMLDivElement | null = null;
   /** Какие грани можно подсвечивать (например, только плоские для эскиза) */
   hoverFilter: ((bodyId: number, faceId: number) => boolean) | null = null;
   /** Привязка к сетке: в эскизе и при перемещении манипулятором */
@@ -254,6 +266,7 @@ export class Viewport {
         if (dragging) this.gizmoBusy = true;
         return;
       }
+      if (!dragging) this.hideDragLabel();
       if (dragging) {
         this.gizmoBusy = true;
         this.dragStart.copy(obj.position);
@@ -272,8 +285,9 @@ export class Viewport {
       const h = this.handleState;
       if (h && this.gizmo.object === this.handle) {
         const p = this.handle.position;
-        h.onChange(dot(sub([p.x, p.y, p.z], h.origin), h.normal));
-      }
+        this.handleDist = dot(sub([p.x, p.y, p.z], h.origin), h.normal);
+        h.onChange(this.handleDist);
+      } else if (obj && this.gizmo.dragging) this.showDragLabel(obj);
     });
     this.scene.add(this.gizmo.getHelper());
 
@@ -301,6 +315,7 @@ export class Viewport {
     this.renderer.render(this.scene, this.camera);
     this.updateViewCube();
     this.updateDimLabels();
+    this.updateHandleLabel();
     this.onFrame();
   }
 
@@ -505,6 +520,12 @@ export class Viewport {
     let box: { x: number; y: number } | null = null;
     // Жест «касание несколькими пальцами»: сколько пальцев было и сдвигались ли они
     let tap: { t0: number; max: number; moved: boolean; starts: Map<number, [number, number]> } | null = null;
+    let press: { x: number; y: number; timer: number } | null = null;
+    let pressFired = false;
+    const cancelPress = () => {
+      if (press) clearTimeout(press.timer);
+      press = null;
+    };
 
     const swallow = (e: PointerEvent) => {
       e.stopImmediatePropagation();
@@ -542,6 +563,23 @@ export class Viewport {
         if (this.sketchPlane && downs.size === 1 && e.button === 0 && draws) this.emitSketch("down", e);
         box = !this.sketchPlane && this.boxSelect && downs.size === 1 && e.button === 0 ? { x: e.clientX, y: e.clientY } : null;
         if (downs.size > 1) this.boxEl.style.display = "none";
+        // Удержание на месте — отдельное действие (например, эскиз на грани)
+        cancelPress();
+        pressFired = false;
+        if (!this.sketchPlane && downs.size === 1 && e.button === 0) {
+          const { clientX: x, clientY: y } = e;
+          press = {
+            x,
+            y,
+            timer: window.setTimeout(() => {
+              press = null;
+              if (this.gizmoBusy || this.gizmo.dragging) return;
+              pressFired = true;
+              this.onLongPress(this.pick(x, y, "face"));
+            }, LONG_PRESS_MS),
+          };
+        }
+        if (downs.size > 1) cancelPress();
         // Вращение вокруг точки модели под пальцем/курсором
         const rotates = e.pointerType === "touch" || (e.pointerType === "mouse" && e.button === 0);
         if (!this.sketchPlane && !this.boxSelect && downs.size === 1 && rotates) this.pivotAt(e.clientX, e.clientY);
@@ -555,6 +593,7 @@ export class Viewport {
         if (ignored.has(e.pointerId)) return swallow(e);
         const s = tap?.starts.get(e.pointerId);
         if (tap && s && Math.hypot(e.clientX - s[0], e.clientY - s[1]) > GESTURE_MOVE) tap.moved = true;
+        if (press && Math.hypot(e.clientX - press.x, e.clientY - press.y) > LONG_PRESS_MOVE) cancelPress();
       },
       { capture: true },
     );
@@ -599,6 +638,14 @@ export class Viewport {
       { capture: true },
     );
     const up = (e: PointerEvent) => {
+      cancelPress();
+      if (pressFired) {
+        // Удержание уже сработало — касанием-выбором это не считаем
+        pressFired = false;
+        downs.delete(e.pointerId);
+        if (downs.size === 0) multiTouch = false;
+        return;
+      }
       const d = downs.get(e.pointerId);
       downs.delete(e.pointerId);
       const wasMulti = multiTouch;
@@ -623,6 +670,7 @@ export class Viewport {
     };
     el.addEventListener("pointerup", up);
     el.addEventListener("pointercancel", (e) => {
+      cancelPress();
       if (e.pointerType === "pen") this.penDown = false;
       ignored.delete(e.pointerId);
       downs.delete(e.pointerId);
@@ -671,6 +719,11 @@ export class Viewport {
       }
     }
     if (mode === "edge") return this.pickEdge(cx, cy, bodyHit?.distance ?? Infinity);
+    if (mode === "auto") {
+      // Ребро — только если палец/перо совсем рядом с ним, иначе грань под касанием
+      const edge = this.pickEdge(cx, cy, bodyHit?.distance ?? Infinity, AUTO_EDGE_PX);
+      if (edge) return edge;
+    }
     if (!bodyHit) {
       // Вспомогательные плоскости выбираются, только если луч не попал в тело
       const fills = this.planeRoot.children.flatMap((g) => g.children.filter((c) => c.userData.fill));
@@ -682,14 +735,14 @@ export class Viewport {
     const fg = (g.userData.faceGroups as { start: number; count: number; faceId: number }[]).find(
       (f) => tri >= f.start && tri < f.start + f.count,
     );
-    return { kind: mode === "face" ? "face" : "body", id: g.userData.bodyId, faceId: fg?.faceId ?? -1 };
+    return { kind: mode === "face" || mode === "auto" ? "face" : "body", id: g.userData.bodyId, faceId: fg?.faceId ?? -1 };
   }
 
   /**
    * Ребро ищем в экранных координатах: ближайший к пальцу отрезок в пределах
    * EDGE_PICK_PX, не закрытый поверхностью (не дальше точки попадания луча в тело).
    */
-  private pickEdge(cx: number, cy: number, surfaceDist: number): Pick {
+  private pickEdge(cx: number, cy: number, surfaceDist: number, maxPx = EDGE_PICK_PX): Pick {
     const r = this.renderer.domElement.getBoundingClientRect();
     const px = cx - r.left;
     const py = cy - r.top;
@@ -701,7 +754,7 @@ export class Viewport {
     const a = new THREE.Vector3();
     const b = new THREE.Vector3();
     let best: Pick = null;
-    let bestD = EDGE_PICK_PX;
+    let bestD = maxPx;
     for (const [id, g] of this.groups) {
       if (g.userData.locked && !this.lockedPickable) continue;
       const pos = (g.children[1] as THREE.LineSegments).geometry.getAttribute("position");
@@ -1435,8 +1488,20 @@ export class Viewport {
   // ---------- вытягивание ----------
 
   /** Ручка-стрелка вдоль нормали профиля; перетаскивание меняет расстояние */
-  showExtrudeHandle(origin: Vec3, normal: Vec3, distance: number, onChange: (d: number) => void) {
+  showExtrudeHandle(origin: Vec3, normal: Vec3, distance: number, onChange: (d: number) => void, format?: (d: number) => string) {
     this.handleState = { origin, normal, onChange };
+    this.handleDist = distance;
+    this.handleFormat = format ?? null;
+    if (format && !this.handleLabel) {
+      // Подпись с текущим значением у стрелки; касание — ввести число
+      const b = document.createElement("button");
+      b.className = "dim-label editable handle-label";
+      b.addEventListener("pointerdown", (e) => e.stopPropagation());
+      b.addEventListener("click", () => this.onHandleEdit(b, this.handleDist));
+      this.dimLayer.append(b);
+      this.handleLabel = b;
+    }
+    if (this.handleLabel) this.handleLabel.style.display = format ? "" : "none";
     this.handle.position.copy(v3(origin)).addScaledVector(v3(normal), distance);
     this.handle.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), v3(normal));
     this.gizmo.space = "local";
@@ -1447,13 +1512,53 @@ export class Viewport {
 
   setHandleDistance(d: number) {
     const h = this.handleState;
+    this.handleDist = d;
     if (h) this.handle.position.copy(v3(h.origin)).addScaledVector(v3(h.normal), d);
   }
 
   hideExtrudeHandle() {
+    if (this.handleLabel) this.handleLabel.style.display = "none";
     if (!this.handleState) return;
     this.handleState = null;
     this.gizmo.detach();
+  }
+
+  /** Подпись у стрелки следует за ней (в кадре) */
+  private updateHandleLabel() {
+    const l = this.handleLabel;
+    if (!l || !this.handleState || !this.handleFormat || l.style.display === "none") return;
+    const text = this.handleFormat(this.handleDist);
+    if (l.textContent !== text) l.textContent = text;
+    const p = this.handle.position;
+    const sp = this.screenOf([p.x, p.y, p.z]);
+    // Справа от наконечника стрелки, чтобы не закрывать её
+    l.style.transform = `translate(${(sp.x + 46).toFixed(0)}px, ${(sp.y - 46).toFixed(0)}px) translate(-50%, -50%)`;
+  }
+
+  /** Во время перетаскивания манипулятора — смещение или коэффициент масштаба рядом с телом */
+  private showDragLabel(obj: THREE.Object3D) {
+    if (!this.dragLabel) {
+      this.dragLabel = document.createElement("div");
+      this.dragLabel.className = "dim-label drag-label";
+      this.dimLayer.append(this.dragLabel);
+    }
+    const f = (v: number) => String(+v.toFixed(2));
+    let text: string;
+    if (this.gizmoMode === "scale") {
+      const s = obj.scale;
+      text = Math.abs(s.x - s.y) + Math.abs(s.y - s.z) < 1e-6 ? `× ${f(s.x)}` : `× ${f(s.x)} · ${f(s.y)} · ${f(s.z)}`;
+    } else {
+      const d = obj.position.clone().sub(this.dragStart);
+      text = `Δ ${f(d.x)}, ${f(d.y)}, ${f(d.z)} мм`;
+    }
+    this.dragLabel.textContent = text;
+    this.dragLabel.style.display = "";
+    const sp = this.screenOf([obj.position.x, obj.position.y, obj.position.z]);
+    this.dragLabel.style.transform = `translate(${sp.x.toFixed(0)}px, ${(sp.y + 70).toFixed(0)}px) translate(-50%, -50%)`;
+  }
+
+  private hideDragLabel() {
+    if (this.dragLabel) this.dragLabel.style.display = "none";
   }
 
   /** Миниатюра для списка проектов (без манипуляторов и предпросмотра) */

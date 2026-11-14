@@ -52,7 +52,7 @@ let mode: Mode = "normal";
 let selection: number[] = [];
 let selProfile: ProfileRef | null = null;
 let multi = false;
-let pickMode: PickMode = "body";
+let pickMode: PickMode = (["auto", "body", "face", "edge"].includes(getPref("pick") ?? "") ? getPref("pick") : "auto") as PickMode;
 /** Выбранные грани/рёбра одного тела; body — версия тела, к которой относятся id */
 let sub: (SubSelection & { body: Body }) | null = null;
 /** Выбранная вспомогательная плоскость */
@@ -132,8 +132,22 @@ function toggleSub(bodyId: number, kind: "faces" | "edges", id: number) {
   refresh();
 }
 
+const DOUBLE_TAP_MS = 380;
+let lastTap: { t: number; bodyId: number } | null = null;
+
+function selectWholeBody(id: number) {
+  if (doc.get(id)?.locked) return toast("Тело заблокировано");
+  sub = null;
+  selProfile = null;
+  selPlane = null;
+  selection = multi ? [...new Set([...selection, id])] : [id];
+  haptic("tick");
+  refresh();
+}
+
 function setPickMode(m: PickMode) {
   pickMode = m;
+  setPref("pick", m);
   sub = null;
   if (m !== "body") selection = [];
   refresh();
@@ -155,6 +169,14 @@ view.onTap = (pick: Pick) => {
   if (pick.kind === "profile") return selectProfile({ sketchId: pick.sketchId, index: pick.index });
   if (pick.kind === "plane") return selectPlane(pick.id);
   if (pick.kind === "vertex") return;
+  // Двойное касание одного тела — выбрать тело целиком (вместо грани/ребра)
+  const now = performance.now();
+  const twice = lastTap && lastTap.bodyId === pick.id && now - lastTap.t < DOUBLE_TAP_MS;
+  lastTap = { t: now, bodyId: pick.id };
+  if (twice && (pick.kind === "face" || pick.kind === "edge")) {
+    lastTap = null;
+    return selectWholeBody(pick.id);
+  }
   if (pick.kind === "face") return toggleSub(pick.id, "faces", pick.faceId);
   if (pick.kind === "edge") return toggleSub(pick.id, "edges", pick.edgeId);
   select(pick.id);
@@ -1313,25 +1335,82 @@ function updatePreview() {
   }
 }
 
+/** Что делать с числом, введённым в подпись у стрелки, — задаётся текущим контекстом */
+let handleSetter: ((v: number) => void) | null = null;
+
+view.onHandleEdit = (label, value) => {
+  if (handleSetter) editValueAt(label, value, handleSetter);
+};
+
+/** Поле ввода поверх подписи на холсте; своя клавиатура на пальце/пере */
+function editValueAt(label: HTMLElement, value: number, onCommit: (v: number) => void) {
+  const input = el("input", { type: "text", inputMode: isTouchLike() ? "none" : "decimal", autocomplete: "off", className: "dim-input", value: fmt(value) });
+  input.dataset.num = "";
+  input.style.transform = label.style.transform;
+  label.style.visibility = "hidden";
+  label.parentElement!.append(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = (commit: boolean) => {
+    if (done) return;
+    done = true;
+    input.remove();
+    label.style.visibility = "";
+    const v = evalExpr(input.value);
+    if (commit && v !== null) onCommit(v);
+    else if (commit) toast("Не понял число — пример: 40, 40+5, 4см", true);
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") finish(true);
+    if (e.key === "Escape") finish(false);
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
 function syncExtrude() {
+  handleSetter = null;
   if (mode === "plane") return syncPlaneTool();
   view.setPlanePreview(null);
   // Скругление/фаска: стрелка на середине ребра, направлена внутрь тела
   const ectx = edgeCtx();
   if (ectx) {
-    view.showExtrudeHandle(ectx.frame.mid, ectx.frame.dir, edgeSize, (d) => {
-      edgeSize = Math.max(0.1, Math.round(d * 10) / 10);
-      schedulePreview();
-    });
+    handleSetter = (v) => {
+      if (!(v > 0)) return toast("Размер должен быть больше нуля", true);
+      edgeSize = v;
+      view.setHandleDistance(v);
+      refresh();
+    };
+    view.showExtrudeHandle(
+      ectx.frame.mid,
+      ectx.frame.dir,
+      edgeSize,
+      (d) => {
+        edgeSize = Math.max(0.1, Math.round(d * 10) / 10);
+        schedulePreview();
+      },
+      () => (edgeKind === "fillet" ? `R ${fmt(edgeSize)}` : `Фаска ${fmt(edgeSize)}`),
+    );
     schedulePreview();
     return;
   }
   const fctx = faceCtx();
   if (fctx) {
-    view.showExtrudeHandle(fctx.frame.center, fctx.frame.normal, pp.distance, (d) => {
-      pp.distance = Math.round(d * 100) / 100;
-      schedulePreview();
-    });
+    handleSetter = (v) => {
+      pp.distance = v;
+      view.setHandleDistance(v);
+      refresh();
+    };
+    view.showExtrudeHandle(
+      fctx.frame.center,
+      fctx.frame.normal,
+      pp.distance,
+      (d) => {
+        pp.distance = Math.round(d * 100) / 100;
+        schedulePreview();
+      },
+      (d) => `${d >= 0 ? "+" : ""}${fmt(d)} мм`,
+    );
     schedulePreview();
     return;
   }
@@ -1348,10 +1427,21 @@ function syncExtrude() {
     return;
   }
   const origin = toWorld(ctx.sk.plane, centroid(ctx.prof));
-  view.showExtrudeHandle(origin, ctx.sk.plane.normal, ex.distance, (d) => {
-    ex.distance = Math.round(d * 100) / 100;
-    schedulePreview();
-  });
+  handleSetter = (v) => {
+    ex.distance = v;
+    view.setHandleDistance(v);
+    refresh();
+  };
+  view.showExtrudeHandle(
+    origin,
+    ctx.sk.plane.normal,
+    ex.distance,
+    (d) => {
+      ex.distance = Math.round(d * 100) / 100;
+      schedulePreview();
+    },
+    (d) => (ex.symmetric ? `± ${fmt(Math.abs(d))} мм` : `${fmt(d)} мм`),
+  );
   schedulePreview();
 }
 
@@ -1563,11 +1653,21 @@ function syncPlaneTool() {
   const base = basePlane();
   // Для смещения — стрелка от базовой плоскости, тянется как вытягивание
   if (t.method === "offset" && base) {
-    view.showExtrudeHandle(base.origin, base.normal, t.dist, (d) => {
-      t.dist = Math.round(d * 100) / 100;
-      if (distInput && document.activeElement !== distInput) distInput.value = fmt(t.dist);
-      view.setPlanePreview(computePlane());
-    });
+    handleSetter = (v) => {
+      t.dist = v;
+      refresh();
+    };
+    view.showExtrudeHandle(
+      base.origin,
+      base.normal,
+      t.dist,
+      (d) => {
+        t.dist = Math.round(d * 100) / 100;
+        if (distInput && document.activeElement !== distInput) distInput.value = fmt(t.dist);
+        view.setPlanePreview(computePlane());
+      },
+      (d) => `${fmt(d)} мм`,
+    );
   } else view.hideExtrudeHandle();
   view.setPlanePreview(computePlane());
 }
@@ -1707,6 +1807,7 @@ const commands: Record<string, () => void> = {
   settings: () => showSettings($("[data-cmd=settings]")),
   panel: () => setPanelCollapsed(!$("#app").classList.contains("panel-collapsed")),
   snap: () => applySnap(!view.gridSnap),
+  "pick-auto": () => setPickMode("auto"),
   "pick-body": () => setPickMode("body"),
   "pick-face": () => setPickMode("face"),
   "pick-edge": () => setPickMode("edge"),
@@ -1737,8 +1838,24 @@ const commands: Record<string, () => void> = {
   step: () => exportFile("step"),
 };
 
-document.querySelectorAll<HTMLButtonElement>("button[data-cmd]").forEach((btn) => {
-  btn.addEventListener("click", () => commands[btn.dataset.cmd!]?.());
+// Делегирование: кнопки панели инструментов создаются и пересоздаются динамически
+document.addEventListener("click", (e) => {
+  const btn = (e.target as Element).closest<HTMLButtonElement>("button[data-cmd]");
+  if (!btn || btn.disabled) return;
+  if (suppressClick) {
+    suppressClick = false;
+    return;
+  }
+  const cmd = btn.dataset.cmd!;
+  const group = btn.dataset.group;
+  // Инструмент из группы становится её «лицом» — повторный вызов в одно касание
+  if (group && getPref(`tool:${group}`) !== cmd) {
+    setPref(`tool:${group}`, cmd);
+    renderToolbar();
+  }
+  closeFlyout();
+  commands[cmd]?.();
+  updateToolbarState();
 });
 
 window.addEventListener("keydown", (e) => {
@@ -1790,7 +1907,7 @@ window.addEventListener("keydown", (e) => {
   else if (k === "escape") select(null);
   else if (k === "enter" && selProfile) applyExtrude();
   else if (k === "enter" && faceCtx()) applyPushPull();
-  else if (k === "b" || k === "f" || k === "e") setPickMode(({ b: "body", f: "face", e: "edge" } as const)[k]);
+  else if (k === "a" || k === "b" || k === "f" || k === "e") setPickMode(({ a: "auto", b: "body", f: "face", e: "edge" } as const)[k]);
 });
 
 view.onMoveEnd = moveBody;
@@ -2262,6 +2379,7 @@ function renderMultiPanel(root: HTMLElement, sel: Body[]) {
 }
 
 const PICK_HINTS: Record<PickMode, string> = {
+  auto: "Касание пером — грань, у самого ребра — ребро; двойное касание — тело целиком. Удержание пера на плоской грани — эскиз на ней.",
   vertex: "Касайтесь вершин тел.",
   body: "Касание — выбрать тело или профиль эскиза. «Рамка» — выбрать несколько тел.",
   face: "Касайтесь граней, чтобы выбрать их. Одна плоская грань — можно тянуть стрелкой (тяни-толкай).",
@@ -2452,7 +2570,7 @@ function refresh() {
   view.hoverBody = mode === "normal" && pickMode === "body";
   // Подсветка под курсором: плоские грани при выборе плоскости, иначе — по режиму выбора
   const hoverPick = toolPick ?? (mode === "pickPlane" ? "face" : mode === "normal" ? pickMode : "body");
-  view.hoverMode = hoverPick === "face" || hoverPick === "edge" ? hoverPick : null;
+  view.hoverMode = hoverPick === "face" || hoverPick === "edge" || hoverPick === "auto" ? hoverPick : null;
   view.hoverFilter = mode === "pickPlane" || (mode === "plane" && toolPick === "face") ? isPlanar : null;
   // Сначала ручка вытягивания: от неё зависит, к чему sync прикрепит манипулятор
   syncExtrude();
@@ -2460,15 +2578,12 @@ function refresh() {
   const gizmoSel = mode === "normal" ? selection.filter((id) => !doc.get(id)?.locked) : [];
   view.sync(visible, gizmoSel, doc.sketches, selProfile, draft?.sketchId, doc.planes.filter((p) => !p.hidden), selPlane);
   view.setHighlight(mode === "normal" ? sub : null);
-  for (const m of ["body", "face", "edge"] as const) $(`[data-cmd="pick-${m}"]`).classList.toggle("on", pickMode === m);
+  for (const m of ["auto", "body", "face", "edge"] as const) $(`[data-cmd="pick-${m}"]`)?.classList.toggle("on", pickMode === m);
   renderTree();
   renderProps();
   renderCtxBar();
-  document.querySelectorAll<HTMLButtonElement>("button[data-need]").forEach((btn) => {
-    btn.disabled = selection.length < Number(btn.dataset.need);
-  });
-  $<HTMLButtonElement>('[data-cmd="multi"]').classList.toggle("on", multi);
-  $<HTMLButtonElement>('[data-cmd="box"]').classList.toggle("on", view.boxSelect);
+  updateToolbarState();
+  $("#empty-state").style.display = mode === "normal" && !doc.bodies.length && !doc.sketches.length ? "" : "none";
   $<HTMLButtonElement>('[data-cmd="undo"]').disabled = mode === "pickPlane" || (mode === "normal" && !doc.canUndo());
   $<HTMLButtonElement>('[data-cmd="redo"]').disabled = mode !== "normal" || !doc.canRedo();
   if (mode === "pickPlane") status("Выберите плоскость эскиза");
@@ -2495,6 +2610,150 @@ function isPlanar(bodyId: number, faceId: number): boolean {
   return m.get(faceId)!;
 }
 
+// ---------- панель инструментов: группы с выдвижным меню ----------
+type Tool3 = [cmd: string, ico: string, label: string, need?: number];
+const TOOL_GROUPS: { id: string; label: string; tools: Tool3[] }[] = [
+  { id: "sketch", label: "Эскиз", tools: [["sketch", "✎", "Эскиз"], ["plane", "▱", "Плоскость"]] },
+  { id: "bodies", label: "Тела", tools: [["cube", "▣", "Куб"], ["cylinder", "⬭", "Цилиндр"], ["sphere", "●", "Сфера"]] },
+  { id: "bool", label: "Булевы", tools: [["union", "∪", "Объединить", 2], ["subtract", "∖", "Вычесть", 2], ["intersect", "∩", "Пересечь", 2]] },
+  {
+    id: "edit",
+    label: "Правка",
+    tools: [["multi", "⧉", "Мультивыбор"], ["box", "⬚", "Рамка"], ["select-all", "☰", "Все"], ["duplicate", "⎘", "Копия", 1], ["delete", "✕", "Удалить", 1]],
+  },
+  { id: "file", label: "Файл", tools: [["import", "⇧", "Импорт"], ["stl", "⇩", "STL"], ["step", "⇩", "STEP"], ["save-file", "⇩", "Проект"]] },
+];
+/** Касание после долгого нажатия на кнопку группы не должно запускать инструмент */
+let suppressClick = false;
+
+function toolButton([cmd, ico, label, need]: Tool3, group: string) {
+  const b = el("button", { title: label }, el("span", { className: "ico", textContent: ico }), el("span", { className: "lbl", textContent: label }));
+  b.dataset.cmd = cmd;
+  b.dataset.group = group;
+  if (need) b.dataset.need = String(need);
+  return b;
+}
+
+function renderToolbar() {
+  const box = $("#tool-groups");
+  box.replaceChildren();
+  for (const g of TOOL_GROUPS) {
+    const face = g.tools.find((t) => t[0] === getPref(`tool:${g.id}`)) ?? g.tools[0];
+    const btn = toolButton(face, g.id);
+    btn.classList.add("group-face");
+    // Кнопка группы не отключается — иначе недоступна и стрелка меню; команда сама подскажет, что выбрать
+    delete btn.dataset.need;
+    if (g.tools.length > 1) {
+      // «›» в углу или долгое нажатие — все инструменты группы
+      const more = el("span", { className: "more", textContent: "›", title: `Все: ${g.label}` });
+      more.addEventListener("click", (e) => {
+        e.stopPropagation();
+        openFlyout(g, btn);
+      });
+      btn.append(more);
+      let timer = 0;
+      btn.addEventListener("pointerdown", () => {
+        timer = window.setTimeout(() => {
+          suppressClick = true;
+          haptic("tick");
+          openFlyout(g, btn);
+        }, 450);
+      });
+      for (const ev of ["pointerup", "pointerleave", "pointercancel"]) btn.addEventListener(ev, () => clearTimeout(timer));
+    }
+    box.append(el("div", { className: "group-label", textContent: g.label }), btn);
+  }
+  updateToolbarState();
+}
+
+function openFlyout(g: (typeof TOOL_GROUPS)[number], anchor: HTMLElement) {
+  closeFlyout();
+  const fly = el("div", { className: "flyout" }, ...g.tools.map((t) => toolButton(t, g.id)));
+  document.body.append(fly);
+  const r = anchor.getBoundingClientRect();
+  const tb = $("#toolbar").getBoundingClientRect();
+  const left = $("#app").classList.contains("left-hand");
+  fly.style.top = `${Math.min(r.top, innerHeight - fly.offsetHeight - 8)}px`;
+  fly.style.left = `${left ? tb.left - fly.offsetWidth - 10 : tb.right + 10}px`;
+  updateToolbarState();
+  setTimeout(() => {
+    const close = (e: Event) => {
+      if (!fly.contains(e.target as Node) && !anchor.contains(e.target as Node)) {
+        closeFlyout();
+        document.removeEventListener("pointerdown", close, true);
+      }
+    };
+    document.addEventListener("pointerdown", close, true);
+  });
+}
+
+function closeFlyout() {
+  document.querySelector(".flyout")?.remove();
+}
+
+/** Включённые/недоступные кнопки — и на панели, и в открытом выдвижном меню */
+function updateToolbarState() {
+  document.querySelectorAll<HTMLButtonElement>("button[data-need]").forEach((btn) => {
+    btn.disabled = selection.length < Number(btn.dataset.need);
+  });
+  document.querySelectorAll('[data-cmd="multi"]').forEach((b) => b.classList.toggle("on", multi));
+  document.querySelectorAll('[data-cmd="box"]').forEach((b) => b.classList.toggle("on", view.boxSelect));
+}
+
+// ---------- долгое нажатие: эскиз на грани ----------
+view.onLongPress = (pick) => {
+  if (mode !== "normal" || !pick) return;
+  if (pick.kind === "face") {
+    const b = doc.get(pick.id);
+    const pl = b && K.facePlane(b.shape, pick.faceId);
+    if (!b || !pl) return toast("Эскиз можно начать только на плоской грани");
+    haptic("confirm");
+    return startSketch(pl, b.id);
+  }
+  if (pick.kind === "profile") {
+    const sk = doc.getSketch(pick.sketchId)!;
+    haptic("confirm");
+    return startSketch(sk.plane, sk.hostBodyId, sk);
+  }
+  if (pick.kind === "plane") {
+    haptic("confirm");
+    return startSketch(doc.getPlane(pick.id)!.plane);
+  }
+};
+
+// ---------- первые шаги ----------
+const ONBOARD: { ico: string; title: string; text: string }[] = [
+  { ico: "✎", title: "Перо рисует и выбирает", text: "Касание пером — грань, у самого ребра — ребро. Двойное касание — всё тело." },
+  { ico: "✋", title: "Пальцы управляют видом", text: "Один палец — вращать вокруг точки под пальцем, два — сдвиг и масштаб. Ладонь на экране, пока работает перо, игнорируется." },
+  { ico: "↶", title: "Жесты отмены", text: "Касание двумя пальцами — отменить, тремя — повторить." },
+  { ico: "▭", title: "Эскиз и числа", text: "Удерживайте перо на плоской грани — начнётся эскиз на ней. Подписи у стрелок и размеров можно нажать и ввести число или выражение." },
+];
+
+function showOnboarding(step = 0) {
+  document.querySelector("#onboard")?.remove();
+  const c = ONBOARD[step];
+  const last = step === ONBOARD.length - 1;
+  const finish = () => {
+    setPref("onboarded", "1");
+    document.querySelector("#onboard")?.remove();
+  };
+  const skip = el("button", { textContent: "Пропустить" });
+  skip.addEventListener("click", finish);
+  const next = el("button", { className: "primary", textContent: last ? "Начать" : "Далее" });
+  next.addEventListener("click", () => (last ? finish() : showOnboarding(step + 1)));
+  const dots = el("div", { className: "dots" }, ...ONBOARD.map((_, i) => el("span", { className: i === step ? "on" : "" })));
+  const card = el(
+    "div",
+    { className: "onboard-card" },
+    el("div", { className: "big", textContent: c.ico }),
+    el("h2", { textContent: c.title }),
+    el("p", { textContent: c.text }),
+    dots,
+    el("div", { className: "row" }, skip, next),
+  );
+  document.body.append(el("div", { id: "onboard", className: "modal" }, card));
+}
+
 // ---------- контекстная панель у выделения ----------
 type CtxItem = [ico: string, label: string, fn: (btn: HTMLElement) => void, on?: boolean];
 const ctxBar = el("div", { className: "ctxbar" });
@@ -2506,15 +2765,17 @@ function ctxItems(): CtxItem[] {
   if (mode !== "normal") return [];
   const sel = selectedBodies();
   if (sub) {
+    const bodyItem: CtxItem = ["⬚", "Тело", () => selectWholeBody(sub!.bodyId)];
     const e = edgeCtx();
     if (e)
       return [
+        bodyItem,
         ["◜", "Скругл.", () => ((edgeKind = "fillet"), refresh()), edgeKind === "fillet"],
         ["◸", "Фаска", () => ((edgeKind = "chamfer"), refresh()), edgeKind === "chamfer"],
         ["✓", "Применить", () => applyEdgeOp()],
       ];
     const f = faceCtx();
-    const items: CtxItem[] = [];
+    const items: CtxItem[] = [bodyItem];
     if (f) {
       items.push(["⇕", "Тянуть", () => distInput?.focus()]);
       items.push(["✎", "Эскиз", () => startSketch(K.facePlane(f.body.shape, f.faceId)!, f.body.id)]);
@@ -2653,7 +2914,7 @@ function showSettings(btn: HTMLElement) {
   ];
   // В APK полноэкранный режим включён всегда (системные панели скрыты в MainActivity)
   if (!Capacitor.isNativePlatform()) items.push([document.fullscreenElement ? "Выйти из полного экрана" : "Полный экран", toggleFullscreen]);
-  items.push(["Жесты: 2 пальца — отменить, 3 — повторить", () => {}]);
+  items.push(["Подсказки: перо, жесты, эскиз", () => showOnboarding(0)]);
   showMenu(btn, items);
 }
 
@@ -2698,6 +2959,7 @@ applyTheme((getPref("theme") as Theme | null) ?? (prefersDark ? "dark" : "light"
 setLeftHand(getPref("leftHand") === "1");
 setPanelCollapsed(getPref("panel") === "0");
 installNumpad();
+renderToolbar();
 applySnap(getPref("snap") !== "0");
 if (getPref("projection") === "ortho") view.setProjection("ortho");
 
@@ -2987,6 +3249,7 @@ fileInput.addEventListener("change", async () => {
   }
   $("#loader").classList.add("hidden");
   status(`Ядро OpenCascade готово за ${((performance.now() - t0) / 1000).toFixed(1)} с`);
+  if (getPref("onboarded") !== "1") showOnboarding(0);
   (window as any).__tabcad = { doc, view, K };
 
   S.requestPersistence();
