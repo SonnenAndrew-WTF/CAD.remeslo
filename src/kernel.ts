@@ -28,7 +28,7 @@ import {
   type Shape3D,
   type AnyShape,
 } from "replicad";
-import { corners, planeFrom, scale, toWorld, type Profile, type SketchPlane, type V2, type Vec3 } from "./sketch";
+import { corners, planeFrom, scale, toWorld, type Profile, type RSeg, type SketchPlane, type V2, type Vec3 } from "./sketch";
 
 export type Shape = Shape3D;
 export type { Vec3, Profile, SketchPlane };
@@ -231,6 +231,33 @@ function filletCorners(d: Drawing, pts: V2[], radii?: number[]): Drawing {
   return d;
 }
 
+/** Замкнутая граница авто-области из точных отрезков и дуг */
+function loopDrawing(segs: RSeg[]): Drawing {
+  let pen = draw(segs[0].a);
+  for (const sg of segs) {
+    if (sg.k === "line") pen = pen.lineTo(sg.b);
+    else if (sg.k === "arc") pen = pen.threePointsArcTo(sg.b, sg.m);
+    else {
+      // Участок эллипса (не длиннее четверти): направление обхода — по средней точке
+      const ccw = (sg.m[0] - sg.a[0]) * (sg.b[1] - sg.m[1]) - (sg.m[1] - sg.a[1]) * (sg.b[0] - sg.m[0]) > 0;
+      pen = pen.ellipseTo(sg.b, sg.rx, sg.ry, 0, false, ccw);
+    }
+  }
+  return pen.close();
+}
+
+/** Область: внешняя граница минус отверстия; несколько соседних областей сливаются */
+function regionDrawing(p: Extract<Profile, { kind: "region" }>): Drawing {
+  let all: Drawing | null = null;
+  for (const part of p.parts) {
+    let d = loopDrawing(part.outer);
+    for (const h of part.holes) d = d.cut(loopDrawing(h));
+    all = all ? all.fuse(d) : d;
+  }
+  if (!all) throw new Error("Пустая область");
+  return all;
+}
+
 function profileDrawing(p: Profile): Drawing {
   switch (p.kind) {
     case "rect":
@@ -260,6 +287,8 @@ function profileDrawing(p: Profile): Drawing {
       for (const q of p.pts.slice(1)) pen = pen.lineTo(q);
       return filletCorners(pen.close(), p.pts, p.radii);
     }
+    case "region":
+      return regionDrawing(p);
     case "path":
     case "axis":
       throw new Error("Контур не замкнут — его нельзя вытянуть или повернуть");

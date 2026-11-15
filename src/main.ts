@@ -1,6 +1,8 @@
 import "./style.css";
 import { Doc, type Body, type RefPlane, type Sketch } from "./doc";
 import { CONSTRAINTS, lines as conLines, entityAnchor, isValidRef, lines as profileLines, pickEntity, prepareProfiles, solve, type Constraint, type ConstraintKind, type EntRef } from "./constraints";
+import { sketchRegions } from "./regions";
+import { recognize } from "./recognize";
 import { Viewport, type Dim, type Pick, type PickMode, type ProfileRef, type SubSelection } from "./viewport";
 import * as K from "./kernel";
 import type { Primitive } from "./kernel";
@@ -86,12 +88,16 @@ const SLOW_OP_MS = 2000;
 
 function run(label: string, fn: () => void, failHint?: string) {
   const t0 = performance.now();
+  // Название операции — подпись шага на шкале истории
+  doc.action = label;
   try {
     fn();
   } catch (err) {
     console.error(err);
     toast(`${label}: операция не удалась${failHint ? ". " + failHint : ""}`, true);
     return;
+  } finally {
+    doc.action = undefined;
   }
   // Медленная операция — признак того, что геометрия сложна для ядра в браузере
   const dt = performance.now() - t0;
@@ -166,7 +172,18 @@ view.onTap = (pick: Pick) => {
   if (mode === "pickAxis") return pickArrayAxis(pick);
   if (mode === "plane") return planeToolTap(pick);
   if (!pick) return select(null);
-  if (pick.kind === "profile") return selectProfile({ sketchId: pick.sketchId, index: pick.index });
+  if (pick.kind === "profile") {
+    if (pick.region === undefined) return selectProfile({ sketchId: pick.sketchId, index: pick.index });
+    // Авто-области одного эскиза набираются касаниями (повторное касание — убрать)
+    const cur = selProfile?.sketchId === pick.sketchId ? (selProfile.regions ?? []) : [];
+    const regions = cur.includes(pick.region) ? cur.filter((r) => r !== pick.region) : [...cur, pick.region];
+    haptic("tick");
+    if (!regions.length) {
+      selProfile = null;
+      return refresh();
+    }
+    return selectProfile({ sketchId: pick.sketchId, index: -1, regions });
+  }
   if (pick.kind === "plane") return selectPlane(pick.id);
   if (pick.kind === "vertex") return;
   // Двойное касание одного тела — выбрать тело целиком (вместо грани/ребра)
@@ -517,6 +534,7 @@ function setBodyFlag(ids: number[], flag: "hidden" | "locked", value: boolean) {
 }
 
 function remove() {
+  if (selProfile?.regions) return toast("Область — часть пересекающихся контуров; удалите линии в эскизе");
   if (selProfile) return deleteProfile(selProfile);
   if (selPlane !== null) return deletePlane(selPlane);
   if (sub) return toast("Удалять можно тела и профили; для граней используйте «Тяни-толкай» или «Оболочку»");
@@ -575,7 +593,13 @@ function exportFile(fmt: "stl" | "step") {
 }
 
 // ---------- эскиз ----------
-type Tool = "select" | "line" | "rect" | "crect" | "circle" | "ellipse" | "slot" | "axis" | "dim" | "constraint";
+type Tool = "select" | "line" | "free" | "rect" | "crect" | "circle" | "ellipse" | "slot" | "axis" | "dim" | "constraint";
+/** Авто-связь отрезка ломаной, которая ещё рисуется (i = -1 — эта же ломаная) */
+interface PendCon {
+  kind: ConstraintKind;
+  seg: number;
+  ref?: EntRef;
+}
 type HandleRef = { i: number; h: number };
 interface Draft {
   sketchId?: number;
@@ -615,12 +639,19 @@ interface Draft {
   constraints: Constraint[];
   conKind: ConstraintKind;
   conFirst: EntRef | null;
+  /** Авто-связи при рисовании: горизонталь/вертикаль, параллельность, совпадение точек */
+  autoCon: boolean;
+  pend: PendCon[];
+  autoHint: { p: V2; kind: ConstraintKind; ref?: EntRef } | null;
+  /** Штрих инструмента «От руки» */
+  stroke: V2[] | null;
 }
 let draft: Draft | null = null;
 
 const TOOLS: { id: Tool; ico: string; label: string; hint: string }[] = [
   { id: "select", ico: "⬚", label: "Точки", hint: "Тяните точку, чтобы переместить её. Касание точки — выбор: её можно удалить или скруглить угол." },
-  { id: "line", ico: "╱", label: "Линия", hint: "Касайтесь точек по очереди. Коснитесь первой точки, чтобы замкнуть контур. Незамкнутые линии сохраняются при смене инструмента." },
+  { id: "line", ico: "╱", label: "Линия", hint: "Касайтесь точек по очереди. Коснитесь первой точки, чтобы замкнуть контур. Незамкнутые линии сохраняются при смене инструмента. Почти горизонтальный, вертикальный или параллельный отрезок выравнивается сам (значок у отрезка)." },
+  { id: "free", ico: "✍", label: "От руки", hint: "Нарисуйте фигуру одним движением — она распознается: линия, ломаная, окружность, эллипс, прямоугольник, треугольник или многоугольник. Концы прилипают к точкам эскиза." },
   { id: "rect", ico: "▭", label: "Прямоуг.", hint: "Проведите от угла до угла (или два касания)." },
   { id: "crect", ico: "⊡", label: "Из центра", hint: "Проведите от центра до угла (или два касания)." },
   { id: "circle", ico: "◯", label: "Круг", hint: "Проведите от центра до края (или два касания)." },
@@ -665,6 +696,10 @@ function startSketch(plane: SketchPlane, hostBodyId?: number, existing?: Sketch)
     constraints: existing?.constraints ? [...existing.constraints] : [],
     conKind: "parallel",
     conFirst: null,
+    autoCon: getPref("autoCon") !== "0",
+    pend: [],
+    autoHint: null,
+    stroke: null,
     snapKind: null,
     hoverEnt: null,
     ortho: draft?.ortho ?? false,
@@ -690,21 +725,132 @@ function startSketch(plane: SketchPlane, hostBodyId?: number, existing?: Sketch)
 
 /** Незаконченная ломаная становится отдельным элементом «Линии» */
 function keepOpenPoly(d: Draft) {
-  if (d.poly.length >= 2) d.profiles.push({ kind: "path", pts: d.poly });
+  if (d.poly.length >= 2) {
+    d.profiles.push({ kind: "path", pts: d.poly });
+    flushPending(d, d.profiles.length - 1, false);
+    autoAttach(d, d.profiles.length - 1);
+  }
   d.poly = [];
+  d.pend = [];
+}
+
+/** Авто-связи отрезков законченной ломаной получают номер её профиля */
+function flushPending(d: Draft, i: number, closed: boolean) {
+  const n = d.poly.length;
+  const fix = (r: EntRef): EntRef => (r.i === -1 ? { ...r, i } : r);
+  for (const pc of d.pend) {
+    if (pc.seg >= (closed ? n : n - 1)) continue;
+    const me: EntRef = { i, e: pc.seg, t: "line" };
+    d.constraints.push(pc.ref ? { kind: pc.kind, a: fix(pc.ref), b: me, auto: true } : { kind: pc.kind, a: me, b: me, auto: true });
+  }
+  d.pend = [];
+}
+
+/**
+ * Точки нового профиля, попавшие (привязкой) в точку или на отрезок другого профиля,
+ * связываются с ним — при правке размеров фигуры остаются соединёнными
+ */
+function autoAttach(d: Draft, i: number) {
+  if (!d.autoCon) return;
+  const P = d.profiles[i];
+  handles(P).forEach((q, h) => {
+    if (P.kind === "rect" && h === 4) return; // центр прямоугольника
+    for (let j = 0; j < d.profiles.length; j++) {
+      if (j === i) continue;
+      const Q = d.profiles[j];
+      const k = handles(Q).findIndex((x, kk) => !(Q.kind === "rect" && kk === 4) && dist2(x, q) < 1e-6);
+      if (k >= 0) {
+        d.constraints.push({ kind: "coincident", a: { i: j, e: k, t: "pt" }, b: { i, e: h, t: "pt" }, auto: true });
+        return;
+      }
+    }
+    for (let j = 0; j < d.profiles.length; j++) {
+      const Q = d.profiles[j];
+      // Стороны прямоугольника не трогаем: связь «на линии» превратила бы его в многоугольник
+      if (j === i || (Q.kind !== "poly" && Q.kind !== "path" && Q.kind !== "axis")) continue;
+      const e = conLines(Q).findIndex(([a, b]) => dist2(q, closestOnSegment(q, a, b)) < 1e-6 && dist2(q, a) > 1e-6 && dist2(q, b) > 1e-6);
+      if (e >= 0) {
+        d.constraints.push({ kind: "onLine", a: { i, e: h, t: "pt" }, b: { i: j, e, t: "line" }, auto: true });
+        return;
+      }
+    }
+  });
+}
+
+const sameEnt = (a: EntRef, b: EntRef) => a.i === b.i && a.e === b.e && a.t === b.t;
+
+const AUTO_DEG = 3;
+/** Почти горизонтальный/вертикальный/параллельный отрезок ломаной — выровнять (мягкая привязка) */
+function autoAlign(d: Draft, p: V2, snapped: boolean): Draft["autoHint"] {
+  if (!d.autoCon || d.ortho || snapped || d.tool !== "line" || !d.poly.length) return null;
+  const last = d.poly[d.poly.length - 1];
+  const v: V2 = [p[0] - last[0], p[1] - last[1]];
+  if (Math.hypot(...v) * view.pxPerUnit() < 24) return null;
+  const tol = (AUTO_DEG * Math.PI) / 180;
+  const ang = Math.atan2(v[1], v[0]);
+  const err = (dir: number) => {
+    const x = (((ang - dir) % Math.PI) + Math.PI) % Math.PI;
+    return Math.min(x, Math.PI - x);
+  };
+  const r4 = (q: V2): V2 => [+q[0].toFixed(4), +q[1].toFixed(4)];
+  if (err(0) < tol) return { p: r4([p[0], last[1]]), kind: "horizontal" };
+  if (err(Math.PI / 2) < tol) return { p: r4([last[0], p[1]]), kind: "vertical" };
+  const cands: { ref: EntRef; a: V2; b: V2; adjacent: boolean }[] = [];
+  d.profiles.forEach((q, i) => {
+    if (q.kind === "poly" || q.kind === "path" || q.kind === "axis") conLines(q).forEach(([a, b], e) => cands.push({ ref: { i, e, t: "line" }, a, b, adjacent: false }));
+  });
+  for (let e = 0; e + 1 < d.poly.length; e++) cands.push({ ref: { i: -1, e, t: "line" }, a: d.poly[e], b: d.poly[e + 1], adjacent: e === d.poly.length - 2 });
+  let best: { kind: ConstraintKind; ref: EntRef; dir: number } | null = null;
+  let bestErr = tol;
+  for (const c of cands) {
+    const la = Math.atan2(c.b[1] - c.a[1], c.b[0] - c.a[0]);
+    // Горизонтальные и вертикальные линии уже учтены выше
+    if (Math.abs(Math.sin(la * 2)) < 1e-6) continue;
+    for (const [kind, off] of [["parallel", 0], ["perpendicular", Math.PI / 2]] as const) {
+      if (kind === "parallel" && c.adjacent) continue; // продолжение того же отрезка
+      const e = err(la + off);
+      if (e < bestErr) [best, bestErr] = [{ kind, ref: c.ref, dir: la + off }, e];
+    }
+  }
+  if (!best) return null;
+  const b = best as { kind: ConstraintKind; ref: EntRef; dir: number };
+  const dx = Math.cos(b.dir);
+  const dy = Math.sin(b.dir);
+  const t = v[0] * dx + v[1] * dy;
+  return { p: r4([last[0] + dx * t, last[1] + dy * t]), kind: b.kind, ref: b.ref };
+}
+
+/** Привязка точки фигуры, распознанной из штриха: к точкам эскиза, иначе к сетке */
+function snapFree(d: Draft, q: V2): V2 {
+  const lim = 16 / view.pxPerUnit();
+  let best: V2 | null = null;
+  let bd = lim;
+  for (const t of [...d.profiles.flatMap(snapPointsTyped).map((x) => x.p), ...d.bodySnaps.points, [0, 0] as V2]) {
+    const dd = dist2(t, q);
+    if (dd < bd) [best, bd] = [t, dd];
+  }
+  if (best) return [...(best as V2)] as V2;
+  const s = view.gridSnap ? view.snapStep() : 0.01;
+  return [+(Math.round(q[0] / s) * s).toFixed(4), +(Math.round(q[1] / s) * s).toFixed(4)];
 }
 
 function setTool(t: Tool) {
   const d = draft!;
   if (t !== "line") keepOpenPoly(d);
+  d.stroke = null;
+  d.autoHint = null;
   d.tool = t;
   d.start = d.slotLine = d.sel = d.dimFirst = d.conFirst = null;
   renderProps();
   drawDraft();
 }
 
-function commitProfile(p: Profile) {
-  draft!.profiles.push(p);
+function commitProfile(p: Profile, fromPoly = false) {
+  const d = draft!;
+  d.profiles.push(p);
+  const i = d.profiles.length - 1;
+  if (fromPoly) flushPending(d, i, p.kind === "poly");
+  autoAttach(d, i);
   haptic("confirm");
   renderProps();
 }
@@ -848,6 +994,12 @@ function sketchDims(d: Draft): Dim[] {
   for (let j = 0; j + 1 < chain.length; j++) {
     dims.push({ id: `chain:${j}`, kind: "linear", a: chain[j], b: chain[j + 1], side: 1, text: fmt(dist2(chain[j], chain[j + 1])), editable: false });
   }
+  if (d.autoHint && d.cursor && d.poly.length) {
+    const a = d.poly[d.poly.length - 1];
+    const glyph = CONSTRAINTS.find((x) => x.kind === d.autoHint!.kind)!.glyph;
+    const o = 16 / ppu;
+    dims.push({ id: "autohint", kind: "label", at: [(a[0] + d.cursor[0]) / 2 - o, (a[1] + d.cursor[1]) / 2 + o], text: glyph, editable: false });
+  }
   d.refDims.forEach((r, k) => {
     const g = refDimGeom(d, r);
     if (g && g.dist > 1e-6) dims.push({ id: `ref:${k}`, kind: "linear", a: g.Q, b: g.P, side: 1, offset: 0, text: fmt(g.dist), editable: true });
@@ -855,8 +1007,10 @@ function sketchDims(d: Draft): Dim[] {
   // Значки связей у обоих элементов, со сдвигом, чтобы не закрывать точку
   const off = 14 / ppu;
   d.constraints.forEach((c, k) => {
+    // Авто-совпадения точек не подписываем — их много, и они очевидны
+    if (c.auto && (c.kind === "coincident" || c.kind === "onLine")) return;
     const glyph = CONSTRAINTS.find((x) => x.kind === c.kind)!.glyph;
-    for (const [tag, r] of [["a", c.a], ["b", c.b]] as const) {
+    for (const [tag, r] of (sameEnt(c.a, c.b) ? [["a", c.a]] : [["a", c.a], ["b", c.b]]) as [string, EntRef][]) {
       const at = entityAnchor(d.profiles, r);
       if (at) dims.push({ id: `con:${k}:${tag}`, kind: "label", at: [at[0] + off, at[1] + off], text: glyph, editable: false });
     }
@@ -960,6 +1114,7 @@ function drawDraft() {
   if (d.constraints.length) solve(d.profiles, d.constraints, d.drag ? { i: d.drag.i, h: d.drag.h } : null);
   const open: V2[][] = [];
   if (d.poly.length) open.push(d.cursor ? [...d.poly, d.cursor] : d.poly);
+  if (d.stroke && d.stroke.length > 1) open.push(d.stroke);
   if (d.tool === "slot" && d.start && d.cursor && !d.slotLine) open.push([d.start, d.cursor]);
   const pend = pendingProfile(d);
   if (pend) {
@@ -1002,7 +1157,10 @@ function drawDraft() {
   );
 
   // Живые размеры в строке состояния
+  const autoName: Record<string, string> = { horizontal: "горизонтально", vertical: "вертикально", parallel: "параллельно", perpendicular: "перпендикулярно" };
   if (d.tool === "dim" && d.dimFirst) status("Теперь коснитесь ребра тела или оси (зелёные линии)");
+  else if (d.autoHint && d.poly.length && d.cursor)
+    status(`Авто: ${autoName[d.autoHint.kind]} · отрезок ${fmt(dist2(d.poly[d.poly.length - 1], d.cursor))} мм`);
   else if (d.snapKind && d.cursor && !pend) status(`Привязка: ${d.snapKind} · X ${fmt(d.cursor[0])} Y ${fmt(d.cursor[1])}`);
   else if (pend?.kind === "rect") status(`Прямоугольник ${fmt(pend.w)} × ${fmt(pend.h)} мм`);
   else if (pend?.kind === "circle") status(`Окружность R ${fmt(pend.r)} мм (Ø ${fmt(pend.r * 2)})`);
@@ -1049,7 +1207,10 @@ let lastSnapKey = "";
 view.onSketch = (type, p0, hot, raw, snap) => {
   const d = draft;
   if (!d) return;
-  const p = orthoSnap(d, p0);
+  let p = orthoSnap(d, p0);
+  const auto = autoAlign(d, p, hot);
+  if (auto) p = auto.p;
+  d.autoHint = auto;
   d.cursor = p;
   d.cursorHot = hot;
   // Отклик пером: новая точка привязки
@@ -1061,6 +1222,7 @@ view.onSketch = (type, p0, hot, raw, snap) => {
   if (type === "cancel") {
     if (d.drag) d.profiles[d.drag.i] = d.drag.orig;
     d.drag = null;
+    d.stroke = null;
     d.start = null;
     d.pressStarted = false;
   } else if (d.tool === "select") {
@@ -1074,6 +1236,21 @@ view.onSketch = (type, p0, hot, raw, snap) => {
     } else if (type === "up" && d.drag) {
       d.drag = null;
       renderProps();
+    }
+  } else if (d.tool === "free") {
+    const unit = 1 / view.pxPerUnit();
+    if (type === "down") d.stroke = [raw];
+    else if (type === "move" && d.stroke) {
+      if (dist2(raw, d.stroke[d.stroke.length - 1]) > unit * 1.5) d.stroke.push(raw);
+    } else if (type === "up" && d.stroke) {
+      d.stroke.push(raw);
+      const step = view.gridSnap ? view.snapStep() : 0.01;
+      const rec = recognize(d.stroke, unit, (q) => snapFree(d, q), (v) => Math.max(step, Math.round(v / step) * step));
+      d.stroke = null;
+      if (rec && isValid(rec.profile)) {
+        commitProfile(rec.profile);
+        toast(`✍ ${rec.name}`);
+      } else toast("Не распознал фигуру — нарисуйте крупнее одним движением");
     }
   } else if (d.tool === "constraint") {
     if (type === "up") addConstraintTap(d, raw);
@@ -1094,9 +1271,12 @@ view.onSketch = (type, p0, hot, raw, snap) => {
       const first = d.poly[0];
       const last = d.poly[d.poly.length - 1];
       if (first && d.poly.length >= 3 && dist2(p, first) < 1e-9) {
-        commitProfile({ kind: "poly", pts: d.poly });
+        commitProfile({ kind: "poly", pts: d.poly }, true);
         d.poly = [];
-      } else if (!last || dist2(p, last) > 1e-9) d.poly.push(p);
+      } else if (!last || dist2(p, last) > 1e-9) {
+        if (auto && last) d.pend.push({ kind: auto.kind, seg: d.poly.length - 1, ref: auto.ref });
+        d.poly.push(p);
+      }
     }
   } else if (d.tool === "slot" && d.slotLine) {
     // Третий шаг паза: касание фиксирует ширину
@@ -1136,6 +1316,13 @@ function addConstraintTap(d: Draft, raw: V2) {
   if (d.conKind === "tangent" && d.conFirst) kinds = d.conFirst.t === "line" ? ["circle"] : ["circle", "line"];
   const hit = pickEntity(d.profiles, raw, tol, kinds);
   if (!hit) return toast(def.hint);
+  if (!def.second.length) {
+    // Связь одного элемента (горизонталь/вертикаль)
+    const c: Constraint = { kind: d.conKind, a: hit, b: hit };
+    prepareProfiles(d.profiles, c);
+    d.constraints.push(c);
+    return renderProps();
+  }
   if (!d.conFirst) {
     d.conFirst = hit;
     status("Теперь коснитесь второго элемента");
@@ -1155,8 +1342,10 @@ function stepBack() {
   if (!d) return;
   if (d.slotLine) d.slotLine = null;
   else if (d.start) d.start = null;
-  else if (d.poly.length) d.poly.pop();
-  else if (d.profiles.length) removeProfileAt(d.profiles.length - 1);
+  else if (d.poly.length) {
+    d.poly.pop();
+    d.pend = d.pend.filter((pc) => pc.seg < d.poly.length - 1);
+  } else if (d.profiles.length) removeProfileAt(d.profiles.length - 1);
   renderProps();
   drawDraft();
 }
@@ -1164,7 +1353,7 @@ function stepBack() {
 function closePoly() {
   const d = draft;
   if (!d || d.poly.length < 3) return toast("Нужно минимум 3 точки");
-  commitProfile({ kind: "poly", pts: d.poly });
+  commitProfile({ kind: "poly", pts: d.poly }, true);
   d.poly = [];
   drawDraft();
 }
@@ -1188,10 +1377,18 @@ function finishSketch() {
     refDims: d.refDims,
     constraints: d.constraints.filter((c) => isValidRef(d.profiles, c.a) && isValidRef(d.profiles, c.b)),
   };
-  // Сразу выбираем последний профиль — можно тянуть стрелку
-  selProfile = { sketchId: id, index: d.profiles.length - 1 };
+  // Сразу выбираем последний профиль — можно тянуть стрелку. Если он разрезан
+  // пересечениями на области — пусть пользователь сам коснётся нужных
+  const last = d.profiles.length - 1;
+  const regions = sketchRegions(d.profiles);
+  const whole = regions.some((r) => r.profile === last);
+  selProfile = whole ? { sketchId: id, index: last } : null;
   ex.mode = "auto";
+  doc.action = d.sketchId ? "Правка эскиза" : "Эскиз";
   doc.change({ sketches: [sk] });
+  doc.action = undefined;
+  if (!whole && regions.some((r) => r.profile === undefined))
+    status("Контуры пересекаются — коснитесь областей, которые нужно вытянуть (можно несколько)");
 }
 
 function cancelSketch() {
@@ -1233,11 +1430,37 @@ const ex: ExtrudeOpts = { distance: 20, mode: "auto" };
 let distInput: HTMLInputElement | null = null;
 let opBox: HTMLElement | null = null;
 
+function profileRefValid(ref: ProfileRef) {
+  const sk = doc.getSketch(ref.sketchId);
+  if (!sk) return false;
+  if (!ref.regions) return !!sk.profiles[ref.index];
+  const n = sketchRegions(sk.profiles).length;
+  return ref.regions.length > 0 && ref.regions.every((r) => r < n);
+}
+
+/** Выбранные авто-области как один профиль (соседние сольются в ядре) */
+let regionMemo: { key: string; profiles: Profile[]; prof: Profile } | null = null;
+function regionProfile(sk: Sketch, regions: number[]): Profile | null {
+  const key = `${sk.id}:${regions.join(",")}`;
+  if (regionMemo && regionMemo.key === key && regionMemo.profiles === sk.profiles) return regionMemo.prof;
+  const all = sketchRegions(sk.profiles);
+  const chosen = regions.map((r) => all[r]).filter(Boolean);
+  if (!chosen.length) return null;
+  const prof: Profile = {
+    kind: "region",
+    parts: chosen.map((r) => ({ outer: r.outer.segs, holes: r.holes.map((h) => h.segs) })),
+    pts: chosen.flatMap((r) => r.outer.pts),
+  };
+  regionMemo = { key, profiles: sk.profiles, prof };
+  return prof;
+}
+
 function extrudeCtx() {
   if (mode !== "normal" || !selProfile) return null;
   const sk = doc.getSketch(selProfile.sketchId);
-  const prof = sk?.profiles[selProfile.index];
-  return sk && prof ? { sk, prof } : null;
+  if (!sk) return null;
+  const prof = selProfile.regions ? regionProfile(sk, selProfile.regions) : sk.profiles[selProfile.index];
+  return prof ? { sk, prof } : null;
 }
 
 /** Оси эскиза (для вращения) */
@@ -1806,6 +2029,7 @@ const commands: Record<string, () => void> = {
   theme: () => applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"),
   settings: () => showSettings($("[data-cmd=settings]")),
   panel: () => setPanelCollapsed(!$("#app").classList.contains("panel-collapsed")),
+  history: () => setTimelineOpen($("#timeline").style.display === "none"),
   snap: () => applySnap(!view.gridSnap),
   "pick-auto": () => setPickMode("auto"),
   "pick-body": () => setPickMode("body"),
@@ -1897,6 +2121,7 @@ window.addEventListener("keydown", (e) => {
     if (k === "enter") createPlane();
     return;
   }
+  if (!mod && k === "h") return setTimelineOpen($("#timeline").style.display === "none");
   if (mod && k === "a") {
     e.preventDefault();
     return selectAll();
@@ -2026,6 +2251,8 @@ function profileFields(p: Profile, update: (p: Profile) => void): HTMLElement[] 
         numberField("X2", p.b[0], (v) => update({ ...p, b: [v, p.b[1]] })),
         numberField("Y2", p.b[1], (v) => update({ ...p, b: [p.b[0], v] })),
       ];
+    case "region":
+      return [];
     case "poly":
       return [el("div", { className: "hint", textContent: `${p.pts.length} точек` }), cornerField(p)];
     case "path":
@@ -2099,7 +2326,8 @@ function renderConstraintSection(root: HTMLElement, d: Draft) {
       renderProps();
       drawDraft();
     });
-    root.append(el("div", { className: "prof" }, el("div", { className: "prof-head" }, `${def.glyph} ${def.label}: фигуры ${c.a.i + 1} и ${c.b.i + 1}`, del)));
+    const who = sameEnt(c.a, c.b) ? `фигура ${c.a.i + 1}` : `фигуры ${c.a.i + 1} и ${c.b.i + 1}`;
+    root.append(el("div", { className: "prof" }, el("div", { className: "prof-head" }, `${def.glyph} ${def.label}: ${who}${c.auto ? " · авто" : ""}`, del)));
   });
 }
 
@@ -2114,7 +2342,18 @@ function renderSketchPanel(root: HTMLElement) {
   root.append(el("h3", { textContent: "Эскиз" }), tools, el("p", { className: "hint", textContent: TOOLS.find((t) => t.id === d.tool)!.hint }));
   const orthoBtn = el("button", { className: d.ortho ? "on" : "", textContent: "⊾ Орто", title: "Ортогональный режим (O): отрезки строго по горизонтали/вертикали" });
   orthoBtn.addEventListener("click", () => toggleOrtho());
-  root.append(el("div", { className: "row" }, orthoBtn));
+  const autoBtn = el("button", {
+    className: d.autoCon ? "on" : "",
+    textContent: "⚡ Авто-связи",
+    title: "При рисовании: горизонталь, вертикаль, параллельность и соединение точек ставятся сами",
+  });
+  autoBtn.addEventListener("click", () => {
+    d.autoCon = !d.autoCon;
+    setPref("autoCon", d.autoCon ? "1" : "0");
+    toast(d.autoCon ? "Авто-связи включены" : "Авто-связи выключены");
+    renderProps();
+  });
+  root.append(el("div", { className: "row" }, orthoBtn, autoBtn));
   if (d.tool === "line") root.append(buttonRow(["Замкнуть", closePoly], ["↶ Шаг назад", stepBack]));
   else if (d.tool !== "select" && d.tool !== "dim") root.append(buttonRow(["↶ Шаг назад", stepBack]));
   if (d.tool === "dim" && d.refDims.length) {
@@ -2222,12 +2461,18 @@ function renderExtrudePanel(root: HTMLElement, sk: Sketch, prof: Profile) {
   opBox = el("div", { className: "op" });
   root.append(opBox);
   root.append(buttonRow(["Вытянуть", applyExtrude, "primary"]));
-  root.append(
-    buttonRow(
-      ["Изменить эскиз", () => startSketch(sk.plane, sk.hostBodyId, sk)],
-      ["Удалить", () => deleteProfile(selProfile!)],
-    ),
-  );
+  if (prof.kind === "region")
+    root.append(
+      el("p", { className: "hint", textContent: `Выбрано областей: ${selProfile?.regions?.length ?? 1}. Касайтесь других областей эскиза, чтобы добавить или убрать их.` }),
+      buttonRow(["Изменить эскиз", () => startSketch(sk.plane, sk.hostBodyId, sk)]),
+    );
+  else
+    root.append(
+      buttonRow(
+        ["Изменить эскиз", () => startSketch(sk.plane, sk.hostBodyId, sk)],
+        ["Удалить", () => deleteProfile(selProfile!)],
+      ),
+    );
 }
 
 function renderRevolvePanel(root: HTMLElement, sk: Sketch, prof: Profile) {
@@ -2560,7 +2805,7 @@ function refresh() {
   selection = selection.filter((id) => doc.get(id) && !doc.get(id)!.hidden);
   // Плоскость выбирается отдельно от тел, профилей и граней — новый выбор её снимает
   if (selPlane !== null && (!doc.getPlane(selPlane) || selection.length || selProfile || sub || mode !== "normal")) selPlane = null;
-  if (selProfile && !doc.getSketch(selProfile.sketchId)?.profiles[selProfile.index]) selProfile = null;
+  if (selProfile && !profileRefValid(selProfile)) selProfile = null;
   // id граней/рёбер относятся к конкретной версии тела (после undo/операции — сброс)
   if (sub && doc.get(sub.bodyId) !== sub.body) sub = null;
   $("#app").classList.toggle("sketching", mode !== "normal");
@@ -2590,6 +2835,38 @@ function refresh() {
 }
 
 doc.onChange(refresh);
+doc.onChange(renderTimeline);
+
+// ---------- шкала истории ----------
+function setTimelineOpen(open: boolean) {
+  $("#timeline").style.display = open ? "" : "none";
+  $('[data-cmd="history"]').classList.toggle("on", open);
+  setPref("timeline", open ? "1" : "0");
+  renderTimeline();
+}
+
+/** Шаги истории; касание — вернуться к шагу (все шаги после него можно снова вернуть) */
+function renderTimeline() {
+  const box = $("#timeline");
+  if (box.style.display === "none") return;
+  const { steps, current } = doc.history();
+  box.replaceChildren(
+    ...steps.map((st, i) => {
+      const b = el("button", { className: `step${i === current ? " cur" : ""}${st.undone ? " undone" : ""}`, title: st.label });
+      b.append(el("span", { className: "n", textContent: String(i) }), el("span", { className: "t", textContent: st.label }));
+      b.addEventListener("click", () => {
+        if (mode !== "normal") return toast("Сначала завершите эскиз или инструмент");
+        if (i === current) return;
+        doc.goto(i);
+        haptic("tick");
+        toast(i < current ? `↶ К шагу ${i}` : `↷ К шагу ${i}`);
+      });
+      return b;
+    }),
+  );
+  // Текущий шаг — в видимой части полосы
+  (box.children[current] as HTMLElement | undefined)?.scrollIntoView({ inline: "center", block: "nearest" });
+}
 
 // Плоская ли грань — запрос к ядру дорогой, а подсветка зовёт его на каждое движение мыши
 const planarCache = new WeakMap<K.Shape, Map<number, boolean>>();
@@ -2962,6 +3239,7 @@ installNumpad();
 renderToolbar();
 applySnap(getPref("snap") !== "0");
 if (getPref("projection") === "ortho") view.setProjection("ortho");
+if (getPref("timeline") === "1") setTimelineOpen(true);
 
 // ---------- проекты ----------
 const LAST_KEY = "tabcad:lastProject";

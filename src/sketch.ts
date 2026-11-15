@@ -12,6 +12,18 @@ export interface SketchPlane {
   normal: Vec3;
 }
 
+/** Участок границы авто-области: отрезок, дуга окружности или эллипса через точку m */
+export type RSeg =
+  | { k: "line"; a: V2; b: V2 }
+  | { k: "arc"; a: V2; m: V2; b: V2 }
+  | { k: "ell"; a: V2; m: V2; b: V2; c: V2; rx: number; ry: number };
+
+/** Часть авто-области: внешняя граница и отверстия */
+export interface RegionPart {
+  outer: RSeg[];
+  holes: RSeg[][];
+}
+
 /** radii — радиусы скругления углов в порядке вершин контура (0 — острый угол) */
 export type Profile =
   | { kind: "rect"; x: number; y: number; w: number; h: number; radii?: number[] }
@@ -22,7 +34,12 @@ export type Profile =
   /** Открытая ломаная — не вытягивается, но участвует в связях и привязках */
   | { kind: "path"; pts: V2[] }
   /** Ось — вспомогательная линия для тел вращения и массивов */
-  | { kind: "axis"; a: V2; b: V2 };
+  | { kind: "axis"; a: V2; b: V2 }
+  /**
+   * Авто-область (одна или несколько соседних) — не хранится в эскизе, а вычисляется
+   * из пересечений; pts — внешние границы ломаной для проверок и центра
+   */
+  | { kind: "region"; parts: RegionPart[]; pts: V2[] };
 
 /** Замкнутый ли контур (можно вытянуть или повернуть) */
 export const isClosed = (p: Profile) => p.kind !== "path" && p.kind !== "axis";
@@ -161,7 +178,7 @@ export function roundCorners(pts: V2[], radii?: number[]): V2[] {
   return out;
 }
 
-const rectCorners = (p: { x: number; y: number; w: number; h: number }): V2[] => [
+export const rectCorners = (p: { x: number; y: number; w: number; h: number }): V2[] => [
   [p.x, p.y],
   [p.x + p.w, p.y],
   [p.x + p.w, p.y + p.h],
@@ -197,6 +214,8 @@ export function outline(p: Profile): V2[] {
       return p.pts;
     case "axis":
       return [p.a, p.b];
+    case "region":
+      return p.pts;
   }
 }
 
@@ -211,7 +230,8 @@ export function centroid(p: Profile): V2 {
     case "axis":
       return v2.mul(v2.add(p.a, p.b), 0.5);
     case "poly":
-    case "path": {
+    case "path":
+    case "region": {
       const n = p.pts.length;
       return [p.pts.reduce((s, q) => s + q[0], 0) / n, p.pts.reduce((s, q) => s + q[1], 0) / n];
     }
@@ -234,6 +254,8 @@ export function handles(p: Profile): V2[] {
     case "poly":
     case "path":
       return p.pts;
+    case "region":
+      return [];
   }
 }
 
@@ -253,6 +275,8 @@ export function translateProfile(p: Profile, dx: number, dy: number): Profile {
     case "poly":
     case "path":
       return { ...p, pts: p.pts.map(t) };
+    case "region":
+      return p;
   }
 }
 
@@ -277,6 +301,8 @@ export function moveHandle(p: Profile, h: number, q: V2): Profile {
     case "poly":
     case "path":
       return { ...p, pts: p.pts.map((x, i) => (i === h ? q : x)) };
+    case "region":
+      return p;
   }
 }
 
@@ -345,4 +371,4 @@ export function rectFromCenter(c: V2, q: V2): Profile {
 
 export const fmt = (v: number) => String(+v.toFixed(2));
 
-export const PROFILE_NAMES = { rect: "Прямоугольник", circle: "Окружность", ellipse: "Эллипс", slot: "Паз", poly: "Многоугольник", path: "Линии", axis: "Ось" };
+export const PROFILE_NAMES = { rect: "Прямоугольник", circle: "Окружность", ellipse: "Эллипс", slot: "Паз", poly: "Многоугольник", path: "Линии", axis: "Ось", region: "Область" };

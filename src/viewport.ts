@@ -8,6 +8,7 @@ import { LineSegmentsGeometry } from "three/addons/lines/LineSegmentsGeometry.js
 import { LineMaterial } from "three/addons/lines/LineMaterial.js";
 import type { Body, RefPlane, Sketch } from "./doc";
 import { mesh, type Shape } from "./kernel";
+import { sketchRegions } from "./regions";
 import { closestOnSegment, dot, isClosed, outline, sub, toLocal, toWorld, type Profile, type SketchPlane, type V2, type Vec3 } from "./sketch";
 
 const TAP_MAX_MOVE = 10; // px
@@ -37,7 +38,8 @@ export type Pick =
   | { kind: "body"; id: number; faceId: number }
   | { kind: "face"; id: number; faceId: number }
   | { kind: "edge"; id: number; edgeId: number }
-  | { kind: "profile"; sketchId: number; index: number }
+  /** region — номер авто-области (если область не совпадает с целым профилем) */
+  | { kind: "profile"; sketchId: number; index: number; region?: number }
   | { kind: "plane"; id: number }
   | { kind: "vertex"; id: number; at: Vec3 }
   | null;
@@ -76,6 +78,8 @@ export type SketchEvent = "down" | "move" | "up" | "hover" | "cancel";
 export interface ProfileRef {
   sketchId: number;
   index: number;
+  /** Выбранные авто-области эскиза (index тогда не используется) */
+  regions?: number[];
 }
 
 interface Palette {
@@ -714,8 +718,8 @@ export class Viewport {
       const profHit = this.raycaster.intersectObjects(fills, false)[0];
       // Профиль лежит на грани тела — при равных расстояниях выигрывает профиль
       if (profHit && (!bodyHit || profHit.distance <= bodyHit.distance + 0.5)) {
-        const { sketchId, index } = profHit.object.userData;
-        return { kind: "profile", sketchId, index };
+        const { sketchId, index, region } = profHit.object.userData;
+        return region === undefined ? { kind: "profile", sketchId, index } : { kind: "profile", sketchId, index: -1, region };
       }
     }
     if (mode === "edge") return this.pickEdge(cx, cy, bodyHit?.distance ?? Infinity);
@@ -998,27 +1002,30 @@ export class Viewport {
 
   private buildSketch(sk: Sketch): THREE.Group {
     const g = new THREE.Group();
-    sk.profiles.forEach((p, index) => {
+    // Линии — все профили как нарисованы
+    sk.profiles.forEach((p) => {
       const pts = outline(p).map(([x, y]) => new THREE.Vector2(x, y));
-      if (!isClosed(p)) {
-        const ln = this.openLine(pts.map((q) => [q.x, q.y] as V2), this.palette.sketchLine, p.kind === "axis");
-        ln.matrixAutoUpdate = false;
-        ln.matrix.copy(planeMatrix(sk.plane, 0.06));
-        g.add(ln);
-        return;
-      }
+      const ln = isClosed(p)
+        ? new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: this.palette.sketchLine }))
+        : this.openLine(pts.map((q) => [q.x, q.y] as V2), this.palette.sketchLine, p.kind === "axis");
+      ln.matrixAutoUpdate = false;
+      ln.matrix.copy(planeMatrix(sk.plane, 0.06));
+      g.add(ln);
+    });
+    // Заливки — авто-области: целый профиль или кусок, отрезанный пересечениями
+    const v2 = (q: V2) => new THREE.Vector2(q[0], q[1]);
+    sketchRegions(sk.profiles).forEach((r, k) => {
+      const shape = new THREE.Shape(r.outer.pts.map(v2));
+      shape.holes = r.holes.map((h) => new THREE.Path(h.pts.map(v2)));
       // Заливка чуть приподнята над плоскостью, чтобы не мерцать на грани тела
       const fill = new THREE.Mesh(
-        new THREE.ShapeGeometry(new THREE.Shape(pts)),
+        new THREE.ShapeGeometry(shape),
         new THREE.MeshBasicMaterial({ color: 0x4c8dff, transparent: true, opacity: 0.18, side: THREE.DoubleSide, depthWrite: false }),
       );
       fill.matrixAutoUpdate = false;
       fill.matrix.copy(planeMatrix(sk.plane, 0.05));
-      fill.userData = { fill: true, sketchId: sk.id, index };
-      const line = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: this.palette.sketchLine }));
-      line.matrixAutoUpdate = false;
-      line.matrix.copy(planeMatrix(sk.plane, 0.06));
-      g.add(fill, line);
+      fill.userData = r.profile !== undefined ? { fill: true, sketchId: sk.id, index: r.profile } : { fill: true, sketchId: sk.id, index: -1, region: k };
+      g.add(fill);
     });
     return g;
   }
@@ -1070,7 +1077,10 @@ export class Viewport {
       }
       g.children.forEach((c) => {
         if (!c.userData.fill) return;
-        const sel = selProfile?.sketchId === sk.id && selProfile.index === c.userData.index;
+        const u = c.userData;
+        const sel =
+          selProfile?.sketchId === sk.id &&
+          (selProfile.regions ? u.region !== undefined && selProfile.regions.includes(u.region) : u.index >= 0 && selProfile.index === u.index);
         const mat = (c as THREE.Mesh).material as THREE.MeshBasicMaterial;
         mat.color.set(sel ? 0xffb02e : 0x4c8dff);
         mat.opacity = sel ? 0.45 : 0.18;

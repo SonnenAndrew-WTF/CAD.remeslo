@@ -11,11 +11,14 @@ export interface EntRef {
   t: EntKind;
 }
 
-export type ConstraintKind = "parallel" | "perpendicular" | "collinear" | "tangent" | "coincident" | "onLine";
+export type ConstraintKind = "parallel" | "perpendicular" | "collinear" | "tangent" | "coincident" | "onLine" | "horizontal" | "vertical";
+/** Связь между a и b; у горизонтали/вертикали один элемент (b = a) */
 export interface Constraint {
   kind: ConstraintKind;
   a: EntRef;
   b: EntRef;
+  /** Поставлена автоматически при рисовании */
+  auto?: boolean;
 }
 
 export const CONSTRAINTS: { kind: ConstraintKind; label: string; glyph: string; hint: string; first: EntKind[]; second: EntKind[] }[] = [
@@ -25,6 +28,8 @@ export const CONSTRAINTS: { kind: ConstraintKind; label: string; glyph: string; 
   { kind: "tangent", label: "Касание", glyph: "◠", hint: "Коснитесь окружности и отрезка — окружность сдвинется до касания (или двух окружностей)", first: ["circle", "line"], second: ["circle", "line"] },
   { kind: "coincident", label: "Совпадение", glyph: "●", hint: "Коснитесь двух точек — вторая переместится в первую", first: ["pt"], second: ["pt"] },
   { kind: "onLine", label: "Точка на линии", glyph: "∈", hint: "Коснитесь точки, затем отрезка", first: ["pt"], second: ["line"] },
+  { kind: "horizontal", label: "Горизонтально", glyph: "Г", hint: "Коснитесь отрезка — он станет горизонтальным", first: ["line"], second: [] },
+  { kind: "vertical", label: "Вертикально", glyph: "В", hint: "Коснитесь отрезка — он станет вертикальным", first: ["line"], second: [] },
 ];
 
 // ---------- 2D-векторы ----------
@@ -140,6 +145,21 @@ function applyOne(ps: Profile[], c: Constraint, fixed: Fixed): number {
   const R = ps[ref.i];
 
   switch (c.kind) {
+    case "horizontal":
+    case "vertical": {
+      // Выравниваем одну координату концов; конец под пальцем остаётся на месте
+      const k = c.kind === "horizontal" ? 1 : 0;
+      const [a, b] = lines(P)[mov.e];
+      const n = lines(P).length;
+      const fa = fixed?.i === mov.i && fixed.h === mov.e;
+      const fb = fixed?.i === mov.i && fixed.h === (mov.e + 1) % n;
+      const v = fa ? a[k] : fb ? b[k] : (a[k] + b[k]) / 2;
+      const a2 = [...a] as V2;
+      const b2 = [...b] as V2;
+      a2[k] = b2[k] = v;
+      ps[mov.i] = setLine(P, mov.e, a2, b2);
+      break;
+    }
     case "coincident": {
       const target = handles(R)[ref.e];
       ps[mov.i] = moveHandle(P, mov.e, target);

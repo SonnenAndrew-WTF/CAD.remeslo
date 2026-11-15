@@ -44,6 +44,36 @@ interface State {
   bodies: Body[];
   sketches: Sketch[];
   planes: RefPlane[];
+  /** Что привело к этому состоянию — подпись на шкале истории */
+  label: string;
+}
+
+/** Шаг на шкале истории */
+export interface HistoryStep {
+  label: string;
+  /** Отменённый шаг — его можно вернуть, пока не сделано новое действие */
+  undone: boolean;
+}
+
+/** Подпись шага по разнице состояний: что добавилось, удалилось или изменилось */
+function describe(prev: State, next: State, action?: string): string {
+  const diff = <T extends { id: number; name: string }>(a: T[], b: T[]) => ({
+    added: b.filter((x) => !a.some((y) => y.id === x.id)),
+    removed: a.filter((x) => !b.some((y) => y.id === x.id)),
+    changed: b.filter((x) => a.some((y) => y.id === x.id && y !== x)),
+  });
+  const parts: { added: { name: string }[]; removed: { name: string }[]; changed: { name: string }[] }[] = [
+    diff(prev.bodies, next.bodies),
+    diff(prev.sketches, next.sketches),
+    diff(prev.planes, next.planes),
+  ];
+  const names = (list: { name: string }[]) => list.map((x) => `«${x.name}»`).join(", ");
+  const added = parts.flatMap((d) => d.added);
+  const removed = parts.flatMap((d) => d.removed);
+  const changed = parts.flatMap((d) => d.changed);
+  const what = [added.length ? `+ ${names(added)}` : "", changed.length ? names(changed) : "", removed.length ? `− ${names(removed)}` : ""].filter(Boolean).join(" ");
+  if (action) return what ? `${action}: ${what}` : action;
+  return what || "Изменение";
 }
 
 const PALETTE = ["#7aa2ff", "#ffb02e", "#5dd39e", "#ff7a90", "#b48cff", "#4fd1e8", "#e8d24f"];
@@ -58,7 +88,9 @@ function merge<T extends { id: number }>(list: T[], updates: T[], removeIds: num
 }
 
 export class Doc {
-  private state: State = { bodies: [], sketches: [], planes: [] };
+  private state: State = { bodies: [], sketches: [], planes: [], label: "Начало" };
+  /** Название текущего действия (задаёт интерфейс перед изменением) — для подписи в истории */
+  action: string | undefined;
   private past: State[] = [];
   private future: State[] = [];
   private nextId = 1;
@@ -93,7 +125,7 @@ export class Doc {
 
   /** Заменить содержимое целиком (открытие проекта): история отмены начинается заново */
   load(bodies: Body[], sketches: Sketch[], nextId: number, planes: RefPlane[] = []) {
-    this.state = { bodies, sketches, planes };
+    this.state = { bodies, sketches, planes, label: "Начало" };
     this.past = [];
     this.future = [];
     const ids = [...bodies, ...sketches, ...planes].map((x) => x.id + 1);
@@ -124,6 +156,7 @@ export class Doc {
   }
 
   private commit(next: State) {
+    next.label = describe(this.state, next, this.action);
     this.past.push(this.state);
     if (this.past.length > HISTORY_LIMIT) this.past.shift();
     this.future = [];
@@ -144,6 +177,7 @@ export class Doc {
       bodies: merge(this.state.bodies, opts.bodies ?? [], opts.removeBodies ?? []),
       sketches: merge(this.state.sketches, opts.sketches ?? [], opts.removeSketches ?? []),
       planes: merge(this.state.planes, opts.planes ?? [], opts.removePlanes ?? []),
+      label: "",
     });
   }
 
@@ -172,5 +206,31 @@ export class Doc {
     this.past.push(this.state);
     this.state = next;
     this.emit();
+  }
+
+  /** Шкала истории: прошлые шаги, текущий (index = past.length) и отменённые */
+  history(): { steps: HistoryStep[]; current: number } {
+    const steps = [
+      ...this.past.map((s) => ({ label: s.label, undone: false })),
+      { label: this.state.label, undone: false },
+      ...[...this.future].reverse().map((s) => ({ label: s.label, undone: true })),
+    ];
+    return { steps, current: this.past.length };
+  }
+
+  /** Перейти к шагу истории (несколько отмен/повторов за раз) */
+  goto(index: number) {
+    let moved = false;
+    while (this.past.length > index && this.past.length) {
+      this.future.push(this.state);
+      this.state = this.past.pop()!;
+      moved = true;
+    }
+    while (this.past.length < index && this.future.length) {
+      this.past.push(this.state);
+      this.state = this.future.pop()!;
+      moved = true;
+    }
+    if (moved) this.emit();
   }
 }
