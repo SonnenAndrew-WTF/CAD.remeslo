@@ -30,7 +30,11 @@ export type ConstraintKind =
   | "concentric"
   | "fix"
   | "length"
-  | "diameter";
+  | "diameter"
+  /** Угол между отрезками, градусы */
+  | "angle"
+  /** Расстояние между параллельными отрезками */
+  | "distance";
 
 /** Связь между a и b; у связей одного элемента (горизонталь, закрепление, размер) b = a */
 export interface Constraint {
@@ -70,6 +74,8 @@ export const CONSTRAINTS: ConstraintDef[] = [
   { kind: "fix", label: "Закрепить", glyph: "⚓", hint: "Коснитесь точки — она останется на месте при любых правках", first: ["pt"], second: [] },
   { kind: "length", label: "Длина", glyph: "↔", hint: "", first: ["line"], second: [], dim: true },
   { kind: "diameter", label: "Диаметр", glyph: "Ø", hint: "", first: ["circle"], second: [], dim: true },
+  { kind: "angle", label: "Угол", glyph: "∠", hint: "", first: ["line"], second: ["line"], dim: true },
+  { kind: "distance", label: "Расстояние", glyph: "↕", hint: "", first: ["line"], second: ["line"], dim: true },
 ];
 
 export const sameEnt = (a: EntRef, b: EntRef) => a.i === b.i && a.e === b.e && a.t === b.t;
@@ -117,6 +123,27 @@ export function lineOf(ps: Profile[], r: EntRef): [V2, V2] {
   return lines(ps[r.i])[r.e];
 }
 const circOf = (ps: Profile[], r: EntRef) => (r.i === ORIGIN ? null : circleOf(ps[r.i]));
+
+/**
+ * Угол между отрезками так, как его видно на эскизе: от точки пересечения прямых
+ * лучи идут к серединам отрезков. null — отрезки параллельны
+ */
+export function angleGeom(l1: [V2, V2], l2: [V2, V2]): { X: V2; a1: number; a2: number; angle: number } | null {
+  const d1 = sub(l1[1], l1[0]);
+  const d2 = sub(l2[1], l2[0]);
+  const den = d1[0] * d2[1] - d1[1] * d2[0];
+  if (Math.abs(den) < 1e-9 * (len(d1) * len(d2) || 1)) return null;
+  const q = sub(l2[0], l1[0]);
+  const t = (q[0] * d2[1] - q[1] * d2[0]) / den;
+  const X: V2 = add(l1[0], mul(d1, t));
+  const ray = (l: [V2, V2], d: V2): V2 => {
+    const r = sub(mul(add(l[0], l[1]), 0.5), X);
+    return len(r) > 1e-9 ? r : d;
+  };
+  const r1 = ray(l1, d1);
+  const r2 = ray(l2, d2);
+  return { X, a1: Math.atan2(r1[1], r1[0]), a2: Math.atan2(r2[1], r2[0]), angle: Math.atan2(Math.abs(r1[0] * r2[1] - r1[1] * r2[0]), dot(r1, r2)) };
+}
 
 /** Прямоугольник с наклонной стороной уже не прямоугольник — переводим в многоугольник */
 export function toPoly(p: Profile): Profile {
@@ -301,6 +328,22 @@ function residuals(ps: Profile[], c: Constraint, out: number[]) {
       const ca = circOf(ps, c.a);
       const cb = circOf(ps, c.b);
       if (ca && cb) out.push(ca.c[0] - cb.c[0], ca.c[1] - cb.c[1]);
+      break;
+    }
+    case "angle": {
+      const l1 = lineOf(ps, c.a);
+      const l2 = lineOf(ps, c.b);
+      const g = angleGeom(l1, l2);
+      const L = Math.min(dist2(...l1), dist2(...l2), 100);
+      // Параллельные — угол 0 (или 180°, если лучи смотрят в разные стороны)
+      const ang = g ? g.angle : dot(sub(l1[1], l1[0]), sub(l2[1], l2[0])) >= 0 ? 0 : Math.PI;
+      if (c.v !== undefined) out.push((ang - (c.v * Math.PI) / 180) * L);
+      break;
+    }
+    case "distance": {
+      const [a, b] = lineOf(ps, c.a);
+      const [p, q] = lineOf(ps, c.b);
+      if (c.v !== undefined) out.push(Math.abs(sdist(mul(add(p, q), 0.5), a, b)) - c.v);
       break;
     }
     case "length":

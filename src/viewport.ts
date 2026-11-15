@@ -54,6 +54,8 @@ export interface SubSelection {
 export type Dim =
   | { id: string; kind: "linear"; a: V2; b: V2; side: 1 | -1; text: string; editable: boolean; offset?: number }
   | { id: string; kind: "diameter"; c: V2; r: number; text: string; editable: boolean }
+  /** Угловой размер: дуга с центром c от угла a0 на sw (радианы, со знаком); r — радиус в px */
+  | { id: string; kind: "angle"; c: V2; r: number; a0: number; sw: number; text: string; editable: boolean }
   /** Просто подпись в точке (значки связей эскиза) */
   | { id: string; kind: "label"; at: V2; text: string; editable: false };
 
@@ -1203,7 +1205,17 @@ export class Viewport {
     const holder = new THREE.Group();
     holder.matrixAutoUpdate = false;
     holder.matrix.copy(planeMatrix(pl, 0.02));
-    holder.add(makeGrid(400, 80, this.palette.sketchGrid, 0.7));
+    // Сетка — непрозрачная (цвет уже смешан с фоном), рисуется первой и не пишет глубину:
+    // линии и заливки эскиза всегда поверх неё. Полупрозрачная сетка рисовалась бы после
+    // линий и из-за почти совпадающей глубины проступала сквозь них
+    const bg = new THREE.Color(this.palette.bg);
+    const mix = (c: number) => new THREE.Color(c).lerp(bg, 0.3).getHex();
+    const grid = makeGrid(400, 80, [mix(this.palette.sketchGrid[0]), mix(this.palette.sketchGrid[1])]);
+    const gm = grid.material as THREE.Material;
+    gm.depthWrite = false;
+    grid.renderOrder = -10;
+    holder.renderOrder = -10;
+    holder.add(grid);
     this.sketchGrid = holder;
     this.scene.add(holder);
   }
@@ -1416,6 +1428,14 @@ export class Viewport {
         labels.push({ at: [(A[0] + B[0]) / 2, (A[1] + B[1]) / 2], dim: d });
       } else if (d.kind === "label") {
         labels.push({ at: d.at, dim: d });
+      } else if (d.kind === "angle") {
+        // Дуга между лучами и засечки на концах; подпись — снаружи посередине
+        const R = d.r / ppu;
+        const n = Math.max(6, Math.ceil(Math.abs(d.sw) * 16));
+        const pt = (t: number, rr = R): V2 => [d.c[0] + rr * Math.cos(d.a0 + d.sw * t), d.c[1] + rr * Math.sin(d.a0 + d.sw * t)];
+        for (let k = 0; k < n; k++) line(pt(k / n), pt((k + 1) / n));
+        for (const t of [0, 1]) line(pt(t, R - tick), pt(t, R + tick));
+        labels.push({ at: pt(0.5, R + 18 / ppu), dim: d });
       } else {
         const off = 24 / ppu;
         const u: V2 = [Math.SQRT1_2, Math.SQRT1_2];

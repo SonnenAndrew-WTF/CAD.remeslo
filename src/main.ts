@@ -3,6 +3,7 @@ import { Doc, type Body, type RefPlane, type Sketch } from "./doc";
 import {
   CONSTRAINTS,
   ORIGIN,
+  angleGeom,
   lines as conLines,
   entName,
   entityAnchor,
@@ -662,6 +663,8 @@ interface Draft {
   drag: (HandleRef & { orig: Profile }) | null;
   /** Первая точка размера (инструмент «Размер») */
   dimFirst: HandleRef | null;
+  /** Отрезок, которому только что поставлен размер: касание другого отрезка — угол между ними */
+  dimLine: { ent: EntRef; k: number } | null;
   /** Геометрические связи и их создание */
   constraints: Constraint[];
   conKind: ConstraintKind;
@@ -690,7 +693,7 @@ const TOOLS: { id: Tool; ico: string; label: string; hint: string }[] = [
   { id: "arc", ico: "◠", label: "Дуга", hint: "Проведите от начала до конца дуги (или два касания), затем отведите палец, задавая изгиб, и коснитесь." },
   { id: "axis", ico: "┆", label: "Ось", hint: "Проведите ось (или два касания). Ось нужна для тел вращения и массивов по кругу." },
   { id: "constraint", ico: "∥", label: "Связи", hint: "Выберите тип связи и коснитесь элементов эскиза. Начало координат и оси X/Y тоже можно выбрать — они неподвижны." },
-  { id: "dim", ico: "↔", label: "Размер", hint: "Коснитесь отрезка или окружности — нанесётся размер (длина или диаметр), он держит значение как связь. Точка, затем ребро тела или ось (зелёные линии) — размер до ребра. Касание числа — изменить, пустое поле — удалить." },
+  { id: "dim", ico: "↔", label: "Размер", hint: "Коснитесь отрезка — длина, окружности или дуги — диаметр. Сразу коснитесь второго отрезка — будет угол между ними (у параллельных — расстояние). Точка, затем ребро тела или ось (зелёные линии) — размер до ребра. Касание числа — изменить, пустое поле — удалить." },
 ];
 
 function beginSketch() {
@@ -747,6 +750,7 @@ function startSketch(plane: SketchPlane, hostBodyId?: number, existing?: Sketch)
     sel: null,
     drag: null,
     dimFirst: null,
+    dimLine: null,
   };
   // Вершины и рёбра тела в плоскости эскиза — для привязки (после sync: тела уже в сцене)
   refresh();
@@ -892,7 +896,7 @@ function setTool(t: Tool) {
   d.stroke = null;
   d.autoHint = null;
   d.tool = t;
-  d.start = d.slotLine = d.sel = d.dimFirst = d.conFirst = null;
+  d.start = d.slotLine = d.sel = d.dimFirst = d.conFirst = d.dimLine = null;
   renderProps();
   drawDraft();
 }
@@ -1046,8 +1050,24 @@ function sketchDims(d: Draft): Dim[] {
   };
   // Размеры готовых фигур не показываем — только нанесённые инструментом «Размер» (это связи)
   d.constraints.forEach((c, k) => {
-    if ((c.kind !== "length" && c.kind !== "diameter") || !isValidRef(d.profiles, c.a)) return;
+    if (!["length", "diameter", "angle", "distance"].includes(c.kind) || !isValidRef(d.profiles, c.a) || !isValidRef(d.profiles, c.b)) return;
     const P = d.profiles[c.a.i];
+    if (c.kind === "angle") {
+      const g = angleGeom(lineOf(d.profiles, c.a), lineOf(d.profiles, c.b));
+      if (!g) return;
+      let sw = g.a2 - g.a1;
+      while (sw > Math.PI) sw -= 2 * Math.PI;
+      while (sw <= -Math.PI) sw += 2 * Math.PI;
+      dims.push({ id: `con:${k}`, kind: "angle", c: g.X, r: 46, a0: g.a1, sw, text: `${fmt(c.v ?? (g.angle * 180) / Math.PI)}°`, editable: true });
+      return;
+    }
+    if (c.kind === "distance") {
+      const [a, b] = lineOf(d.profiles, c.a);
+      const [p, q] = lineOf(d.profiles, c.b);
+      const mid: V2 = [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2];
+      dims.push({ id: `con:${k}`, kind: "linear", a: footOnLine(mid, a, b), b: mid, side: 1, offset: 0, text: fmt(c.v ?? 0), editable: true });
+      return;
+    }
     if (c.kind === "length") {
       const [a, b] = lineOf(d.profiles, c.a);
       const side = P.kind === "rect" || (P.kind === "poly" && signedArea(P.pts) > 0) ? -1 : 1;
@@ -1079,7 +1099,7 @@ function sketchDims(d: Draft): Dim[] {
   d.constraints.forEach((c, k) => {
     // Авто-совпадения точек не подписываем — их много, и они очевидны
     if (c.auto && (c.kind === "coincident" || c.kind === "onLine")) return;
-    if (c.kind === "length" || c.kind === "diameter") return; // это размеры — показаны числом
+    if (["length", "diameter", "angle", "distance"].includes(c.kind)) return; // это размеры — показаны числом
     const glyph = CONSTRAINTS.find((x) => x.kind === c.kind)!.glyph;
     for (const [tag, r] of (sameEnt(c.a, c.b) ? [["a", c.a]] : [["a", c.a], ["b", c.b]]) as [string, EntRef][]) {
       const at = entityAnchor(d.profiles, r);
@@ -1157,7 +1177,9 @@ view.onDimEdit = (id, label) => {
     const c = d.constraints[k];
     if (!c) return;
     value = c.v ?? 0;
+    allowZero = c.kind === "distance";
     commit = (v) => {
+      if (c.kind === "angle" && v !== null && v >= 180) return toast("Угол должен быть меньше 180°", true);
       keepStep(d);
       if (v === null) d.constraints.splice(k, 1);
       else c.v = v;
@@ -1211,15 +1233,42 @@ view.onDimEdit = (id, label) => {
 };
 
 /** Размер элемента (длина отрезка или диаметр окружности) — связь со значением */
-function addDim(d: Draft, ent: EntRef) {
+function addDim(d: Draft, ent: EntRef): number {
   const kind: ConstraintKind = ent.t === "line" ? "length" : "diameter";
-  if (d.constraints.some((c) => c.kind === kind && sameEnt(c.a, ent))) return toast("Размер уже нанесён — коснитесь числа, чтобы изменить");
+  if (d.constraints.some((c) => c.kind === kind && sameEnt(c.a, ent))) {
+    toast(ent.t === "line" ? "Длина уже нанесена. Коснитесь второго отрезка — будет угол" : "Размер уже нанесён — коснитесь числа, чтобы изменить");
+    return -1;
+  }
   const P = d.profiles[ent.i];
   const ag = P.kind === "arc" ? arcGeom(P) : null;
   const v = ent.t === "line" ? dist2(...lineOf(d.profiles, ent)) : P.kind === "circle" ? P.r * 2 : ag ? ag.r * 2 : 0;
-  if (!(v > 0)) return;
+  if (!(v > 0)) return -1;
   keepStep(d);
   d.constraints.push({ kind, a: ent, b: ent, v: +v.toFixed(4) });
+  haptic("tick");
+  renderProps();
+  return d.constraints.length - 1;
+}
+
+/**
+ * Второй отрезок после первого: непараллельные — угловой размер, параллельные — расстояние
+ * между ними. Длина, поставленная первым касанием, заменяется (её снимок уже в «шаге назад»)
+ */
+function addPairDim(d: Draft, first: { ent: EntRef; k: number }, ent: EntRef) {
+  const l1 = lineOf(d.profiles, first.ent);
+  const l2 = lineOf(d.profiles, ent);
+  const g = angleGeom(l1, l2);
+  const mid: V2 = [(l2[0][0] + l2[1][0]) / 2, (l2[0][1] + l2[1][1]) / 2];
+  const dist = dist2(mid, footOnLine(mid, l1[0], l1[1]));
+  if (!g && dist < 1e-6) return toast("Отрезки на одной прямой — угла и расстояния между ними нет");
+  const kind: ConstraintKind = g ? "angle" : "distance";
+  const same = (c: Constraint) => c.kind === kind && ((sameEnt(c.a, first.ent) && sameEnt(c.b, ent)) || (sameEnt(c.a, ent) && sameEnt(c.b, first.ent)));
+  if (d.constraints.some(same)) return toast("Этот размер уже нанесён");
+  if (first.k >= 0 && d.constraints[first.k]?.kind === "length") d.constraints.splice(first.k, 1);
+  else keepStep(d);
+  const v = g ? +((g.angle * 180) / Math.PI).toFixed(2) : +dist.toFixed(4);
+  d.constraints.push({ kind, a: first.ent, b: ent, v });
+  toast(g ? `∠ ${fmt(v)}° — угол между отрезками` : `↕ ${fmt(v)} мм — расстояние между параллельными`);
   haptic("tick");
   renderProps();
 }
@@ -1401,6 +1450,7 @@ view.onSketch = (type, p0, hot, raw, snap) => {
       const line = !hit && d.dimFirst ? nearestRefLine(d, raw) : null;
       if (hit) {
         d.dimFirst = hit;
+        d.dimLine = null;
         status("Теперь коснитесь ребра тела или оси (зелёные линии)");
       } else if (line && d.dimFirst) {
         keepStep(d);
@@ -1411,8 +1461,14 @@ view.onSketch = (type, p0, hot, raw, snap) => {
       } else {
         d.dimFirst = null;
         const ent = pickEntity(d.profiles, raw, 18 / view.pxPerUnit(), ["line", "circle"]);
-        if (ent) addDim(d, ent);
-        else toast("Коснитесь отрезка или окружности — появится размер. Точка, затем зелёная линия — размер до ребра");
+        if (ent && ent.t === "line" && d.dimLine && !sameEnt(d.dimLine.ent, ent)) {
+          addPairDim(d, d.dimLine, ent);
+          d.dimLine = null;
+        } else if (ent) {
+          const k = addDim(d, ent);
+          d.dimLine = ent.t === "line" ? { ent, k } : null;
+        } else d.dimLine = null;
+        if (!ent) toast("Коснитесь отрезка или окружности — появится размер. Точка, затем зелёная линия — размер до ребра");
       }
     }
   } else if (d.tool === "line") {
@@ -2536,7 +2592,7 @@ function renderConstraintSection(root: HTMLElement, d: Draft) {
 
 /** Нанесённые размеры с удалением */
 function renderDimSection(root: HTMLElement, d: Draft) {
-  const list = d.constraints.map((c, k) => ({ c, k })).filter(({ c }) => c.kind === "length" || c.kind === "diameter");
+  const list = d.constraints.map((c, k) => ({ c, k })).filter(({ c }) => ["length", "diameter", "angle", "distance"].includes(c.kind));
   if (!list.length) return;
   root.append(el("h3", { textContent: `Размеры (${list.length})` }));
   for (const { c, k } of list) {
@@ -2547,7 +2603,11 @@ function renderDimSection(root: HTMLElement, d: Draft) {
       renderProps();
       drawDraft();
     });
-    const text = c.kind === "length" ? `↔ ${fmt(c.v ?? 0)} мм — отрезок, ${entName(c.a)}` : `Ø ${fmt(c.v ?? 0)} мм — ${entName(c.a)}`;
+    const text =
+      c.kind === "length" ? `↔ ${fmt(c.v ?? 0)} мм — отрезок, ${entName(c.a)}`
+      : c.kind === "angle" ? `∠ ${fmt(c.v ?? 0)}° — ${entName(c.a)} и ${entName(c.b)}`
+      : c.kind === "distance" ? `↕ ${fmt(c.v ?? 0)} мм — ${entName(c.a)} и ${entName(c.b)}`
+      : `Ø ${fmt(c.v ?? 0)} мм — ${entName(c.a)}`;
     root.append(el("div", { className: "prof" }, el("div", { className: "prof-head" }, text, del)));
   }
 }
