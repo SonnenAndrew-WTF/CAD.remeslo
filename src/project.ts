@@ -51,7 +51,7 @@ export function serialize(doc: Doc, name: string): string {
 
 export function deserialize(json: string): { name: string; nextId: number; bodies: Body[]; sketches: Sketch[]; planes: RefPlane[] } {
   const file = JSON.parse(json) as ProjectFile;
-  if (file.format !== FORMAT) throw new Error("Это не файл проекта remeslo.cad");
+  if (file.format !== FORMAT) throw new Error("Это не файл проекта CAD.remeslo");
   if (file.version > VERSION) throw new Error("Файл создан более новой версией приложения");
   const bodies = file.bodies.map(({ brep, ...rest }) => {
     const body: Body = { ...rest, shape: fromBrep(brep) };

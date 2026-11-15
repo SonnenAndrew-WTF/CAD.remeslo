@@ -49,6 +49,8 @@ export interface RefDim {
   i: number;
   h: number;
   ref: [V2, V2];
+  /** Заданное расстояние — размер держит его как связь */
+  v?: number;
 }
 
 export const add = (a: Vec3, b: Vec3): Vec3 => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];

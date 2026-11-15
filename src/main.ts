@@ -1,6 +1,21 @@
 import "./style.css";
 import { Doc, type Body, type RefPlane, type Sketch } from "./doc";
-import { CONSTRAINTS, lines as conLines, entityAnchor, isValidRef, lines as profileLines, pickEntity, prepareProfiles, solve, type Constraint, type ConstraintKind, type EntRef } from "./constraints";
+import {
+  CONSTRAINTS,
+  ORIGIN,
+  lines as conLines,
+  entName,
+  entityAnchor,
+  isValidRef,
+  lineOf,
+  pickEntity,
+  prepareProfiles,
+  sameEnt,
+  solve,
+  type Constraint,
+  type ConstraintKind,
+  type EntRef,
+} from "./constraints";
 import { sketchRegions } from "./regions";
 import { recognize } from "./recognize";
 import { Viewport, type Dim, type Pick, type PickMode, type ProfileRef, type SubSelection } from "./viewport";
@@ -553,7 +568,7 @@ function blobToBase64(blob: Blob): Promise<string> {
 
 /**
  * В браузере — обычное скачивание. В APK скачивание через <a download> не работает:
- * пишем в «Документы/remeslo.cad», а если нет доступа — открываем меню «Поделиться».
+ * пишем в «Документы/CAD.remeslo», а если нет доступа — открываем меню «Поделиться».
  */
 async function download(blob: Blob, name: string, doneMsg = "") {
   if (!Capacitor.isNativePlatform()) {
@@ -566,7 +581,7 @@ async function download(blob: Blob, name: string, doneMsg = "") {
     return;
   }
   const data = await blobToBase64(blob);
-  const path = `remeslo.cad/${name}`;
+  const path = `CAD.remeslo/${name}`;
   try {
     await Filesystem.writeFile({ path, data, directory: Directory.Documents, recursive: true });
     toast(`${doneMsg ? doneMsg + ". " : ""}Сохранено: Документы/${path}`);
@@ -645,6 +660,8 @@ interface Draft {
   autoHint: { p: V2; kind: ConstraintKind; ref?: EntRef } | null;
   /** Штрих инструмента «От руки» */
   stroke: V2[] | null;
+  /** Снимки черновика для «шага назад»: геометрия, связи и размеры вместе */
+  undo: string[];
 }
 let draft: Draft | null = null;
 
@@ -658,8 +675,8 @@ const TOOLS: { id: Tool; ico: string; label: string; hint: string }[] = [
   { id: "ellipse", ico: "⬭", label: "Эллипс", hint: "Проведите от центра до угла описанного прямоугольника." },
   { id: "slot", ico: "⊂⊃", label: "Паз", hint: "Проведите осевую линию паза, затем отведите палец, задавая ширину, и коснитесь." },
   { id: "axis", ico: "┆", label: "Ось", hint: "Проведите ось (или два касания). Ось нужна для тел вращения и массивов по кругу." },
-  { id: "constraint", ico: "∥", label: "Связи", hint: "Выберите тип связи и коснитесь двух элементов эскиза." },
-  { id: "dim", ico: "↔", label: "Размер", hint: "Коснитесь точки эскиза, затем ребра тела или оси (зелёные линии) — появится размер. Коснитесь размера, чтобы задать расстояние." },
+  { id: "constraint", ico: "∥", label: "Связи", hint: "Выберите тип связи и коснитесь элементов эскиза. Начало координат и оси X/Y тоже можно выбрать — они неподвижны." },
+  { id: "dim", ico: "↔", label: "Размер", hint: "Коснитесь отрезка или окружности — нанесётся размер (длина или диаметр), он держит значение как связь. Точка, затем ребро тела или ось (зелёные линии) — размер до ребра. Касание числа — изменить, пустое поле — удалить." },
 ];
 
 function beginSketch() {
@@ -697,6 +714,7 @@ function startSketch(plane: SketchPlane, hostBodyId?: number, existing?: Sketch)
     conKind: "parallel",
     conFirst: null,
     autoCon: getPref("autoCon") !== "0",
+    undo: [],
     pend: [],
     autoHint: null,
     stroke: null,
@@ -723,9 +741,27 @@ function startSketch(plane: SketchPlane, hostBodyId?: number, existing?: Sketch)
   drawDraft();
 }
 
+/** Запомнить состояние черновика перед правкой — «шаг назад» вернёт его целиком */
+function keepStep(d: Draft) {
+  d.undo.push(JSON.stringify({ profiles: d.profiles, constraints: d.constraints, refDims: d.refDims, poly: d.poly, pend: d.pend }));
+  if (d.undo.length > 150) d.undo.shift();
+}
+
+function restoreSnap(d: Draft, json: string) {
+  const st = JSON.parse(json);
+  d.profiles = st.profiles;
+  d.constraints = st.constraints;
+  d.refDims = st.refDims;
+  d.poly = st.poly;
+  d.pend = st.pend;
+  d.sel = d.dimFirst = d.conFirst = d.drag = null;
+  if (d.poly.length && d.tool !== "line") d.tool = "line";
+}
+
 /** Незаконченная ломаная становится отдельным элементом «Линии» */
 function keepOpenPoly(d: Draft) {
   if (d.poly.length >= 2) {
+    keepStep(d);
     d.profiles.push({ kind: "path", pts: d.poly });
     flushPending(d, d.profiles.length - 1, false);
     autoAttach(d, d.profiles.length - 1);
@@ -755,6 +791,10 @@ function autoAttach(d: Draft, i: number) {
   const P = d.profiles[i];
   handles(P).forEach((q, h) => {
     if (P.kind === "rect" && h === 4) return; // центр прямоугольника
+    if (Math.hypot(q[0], q[1]) < 1e-6) {
+      d.constraints.push({ kind: "coincident", a: { i: ORIGIN, e: 0, t: "pt" }, b: { i, e: h, t: "pt" }, auto: true });
+      return;
+    }
     for (let j = 0; j < d.profiles.length; j++) {
       if (j === i) continue;
       const Q = d.profiles[j];
@@ -776,8 +816,6 @@ function autoAttach(d: Draft, i: number) {
     }
   });
 }
-
-const sameEnt = (a: EntRef, b: EntRef) => a.i === b.i && a.e === b.e && a.t === b.t;
 
 const AUTO_DEG = 3;
 /** Почти горизонтальный/вертикальный/параллельный отрезок ломаной — выровнять (мягкая привязка) */
@@ -847,6 +885,8 @@ function setTool(t: Tool) {
 
 function commitProfile(p: Profile, fromPoly = false) {
   const d = draft!;
+  // Ломаная уже запомнена по точкам — её замыкание отменяется вместе с последней точкой
+  if (!fromPoly) keepStep(d);
   d.profiles.push(p);
   const i = d.profiles.length - 1;
   if (fromPoly) flushPending(d, i, p.kind === "poly");
@@ -869,6 +909,7 @@ function deleteSelectedPoint() {
   const d = draft;
   if (!d?.sel) return;
   const { i, h } = d.sel;
+  keepStep(d);
   const res = deleteHandle(d.profiles[i], h);
   if (res) {
     d.profiles[i] = res;
@@ -987,7 +1028,16 @@ function sketchDims(d: Draft): Dim[] {
       }
     }
   };
-  d.profiles.forEach((p, i) => add(p, String(i), true));
+  // Размеры готовых фигур не показываем — только нанесённые инструментом «Размер» (это связи)
+  d.constraints.forEach((c, k) => {
+    if ((c.kind !== "length" && c.kind !== "diameter") || !isValidRef(d.profiles, c.a)) return;
+    const P = d.profiles[c.a.i];
+    if (c.kind === "length") {
+      const [a, b] = lineOf(d.profiles, c.a);
+      const side = P.kind === "rect" || (P.kind === "poly" && signedArea(P.pts) > 0) ? -1 : 1;
+      dims.push({ id: `con:${k}`, kind: "linear", a, b, side, text: fmt(c.v ?? dist2(a, b)), editable: true });
+    } else if (P.kind === "circle") dims.push({ id: `con:${k}`, kind: "diameter", c: [P.cx, P.cy], r: P.r, text: `Ø ${fmt(c.v ?? P.r * 2)}`, editable: true });
+  });
   const pend = pendingProfile(d);
   if (pend) add(pend, "pending", false);
   const chain = d.cursor && d.poly.length ? [...d.poly, d.cursor] : d.poly;
@@ -1009,6 +1059,7 @@ function sketchDims(d: Draft): Dim[] {
   d.constraints.forEach((c, k) => {
     // Авто-совпадения точек не подписываем — их много, и они очевидны
     if (c.auto && (c.kind === "coincident" || c.kind === "onLine")) return;
+    if (c.kind === "length" || c.kind === "diameter") return; // это размеры — показаны числом
     const glyph = CONSTRAINTS.find((x) => x.kind === c.kind)!.glyph;
     for (const [tag, r] of (sameEnt(c.a, c.b) ? [["a", c.a]] : [["a", c.a], ["b", c.b]]) as [string, EntRef][]) {
       const at = entityAnchor(d.profiles, r);
@@ -1064,23 +1115,49 @@ function refDimTarget(d: Draft, k: number): { i: number; value: number; apply: (
   };
 }
 
-/** Касание подписи размера — поле ввода на её месте */
+/** Размеры «точка — грань» держат своё значение: профиль сдвигается обратно */
+function applyRefDims(d: Draft) {
+  d.refDims.forEach((r, k) => {
+    if (r.v === undefined) return;
+    const t = refDimTarget(d, k);
+    if (t && Math.abs(t.value - r.v) > 1e-6) d.profiles[t.i] = t.apply(r.v);
+  });
+}
+
+/** Касание подписи размера — поле ввода на её месте; пустое значение удаляет размер */
 view.onDimEdit = (id, label) => {
   const d = draft;
   if (!d) return;
   const [key, part] = id.split(":");
-  let i: number;
-  let target: { value: number; apply: (v: number) => Profile; allowZero?: boolean } | null;
-  if (key === "ref") {
-    const t = refDimTarget(d, Number(part));
-    i = t?.i ?? -1;
-    target = t;
-  } else {
-    i = Number(key);
-    target = d.profiles[i] ? dimTarget(d.profiles[i], part) : null;
-  }
-  if (!target) return;
-  const input = el("input", { type: "text", inputMode: isTouchLike() ? "none" : "decimal", autocomplete: "off", className: "dim-input", value: fmt(target.value) });
+  const k = Number(part);
+  let value: number;
+  let allowZero = false;
+  let commit: (v: number | null) => void;
+  if (key === "con") {
+    const c = d.constraints[k];
+    if (!c) return;
+    value = c.v ?? 0;
+    commit = (v) => {
+      keepStep(d);
+      if (v === null) d.constraints.splice(k, 1);
+      else c.v = v;
+    };
+  } else if (key === "ref") {
+    const r = d.refDims[k];
+    const g = r && refDimGeom(d, r);
+    if (!g) return;
+    value = g.dist;
+    allowZero = true;
+    commit = (v) => {
+      keepStep(d);
+      if (v === null) d.refDims.splice(k, 1);
+      else {
+        r.v = v;
+        applyRefDims(d);
+      }
+    };
+  } else return;
+  const input = el("input", { type: "text", inputMode: isTouchLike() ? "none" : "decimal", autocomplete: "off", className: "dim-input", value: fmt(value) });
   input.dataset.num = "";
   input.style.transform = label.style.transform;
   label.style.visibility = "hidden";
@@ -1088,15 +1165,21 @@ view.onDimEdit = (id, label) => {
   input.focus();
   input.select();
   let done = false;
-  const finish = (commit: boolean) => {
+  const finish = (ok: boolean) => {
     if (done) return;
     done = true;
     input.remove();
     label.style.visibility = "";
-    const v = evalExpr(input.value) ?? NaN;
-    const ok = target.allowZero ? v >= 0 : v > 0;
-    if (commit && ok && d.profiles[i]) d.profiles[i] = target.apply(v);
-    else if (commit && !ok) toast("Размер должен быть больше нуля", true);
+    if (ok) {
+      if (!input.value.trim()) {
+        commit(null);
+        toast("Размер удалён");
+      } else {
+        const v = evalExpr(input.value) ?? NaN;
+        if (allowZero ? v >= 0 : v > 0) commit(v);
+        else toast("Размер должен быть больше нуля", true);
+      }
+    }
     renderProps();
     drawDraft();
   };
@@ -1107,11 +1190,25 @@ view.onDimEdit = (id, label) => {
   input.addEventListener("blur", () => finish(true));
 };
 
+/** Размер элемента (длина отрезка или диаметр окружности) — связь со значением */
+function addDim(d: Draft, ent: EntRef) {
+  const kind: ConstraintKind = ent.t === "line" ? "length" : "diameter";
+  if (d.constraints.some((c) => c.kind === kind && sameEnt(c.a, ent))) return toast("Размер уже нанесён — коснитесь числа, чтобы изменить");
+  const P = d.profiles[ent.i];
+  const v = ent.t === "line" ? dist2(...lineOf(d.profiles, ent)) : P.kind === "circle" ? P.r * 2 : 0;
+  if (!(v > 0)) return;
+  keepStep(d);
+  d.constraints.push({ kind, a: ent, b: ent, v: +v.toFixed(4) });
+  haptic("tick");
+  renderProps();
+}
+
 function drawDraft() {
   const d = draft;
   if (!d) return;
   // Связи восстанавливаются после любой правки; точка под пальцем остаётся на месте
   if (d.constraints.length) solve(d.profiles, d.constraints, d.drag ? { i: d.drag.i, h: d.drag.h } : null);
+  applyRefDims(d);
   const open: V2[][] = [];
   if (d.poly.length) open.push(d.cursor ? [...d.poly, d.cursor] : d.poly);
   if (d.stroke && d.stroke.length > 1) open.push(d.stroke);
@@ -1125,9 +1222,13 @@ function drawDraft() {
   const hl = [d.sel, d.dimFirst].filter(Boolean).map((r) => handles(d.profiles[r!.i])[r!.h]);
   // Первый выбранный элемент связи подсвечиваем
   const cf = d.conFirst;
-  if (cf && isValidRef(d.profiles, cf)) {
+  if (cf && cf.i === ORIGIN) {
+    const L = 2000;
+    if (cf.t === "pt") hl.push([0, 0]);
+    else open.push(cf.e === 0 ? [[-L, 0], [L, 0]] : [[0, -L], [0, L]]);
+  } else if (cf && isValidRef(d.profiles, cf)) {
     if (cf.t === "pt") hl.push(handles(d.profiles[cf.i])[cf.e]);
-    else if (cf.t === "line") open.push(profileLines(d.profiles[cf.i])[cf.e]);
+    else if (cf.t === "line") open.push(lineOf(d.profiles, cf));
     else {
       const o = outline(d.profiles[cf.i]);
       open.push([...o, o[0]]);
@@ -1229,11 +1330,19 @@ view.onSketch = (type, p0, hot, raw, snap) => {
     if (type === "down") {
       const hit = nearestHandle(d, raw);
       d.sel = hit;
-      d.drag = hit && { ...hit, orig: d.profiles[hit.i] };
+      if (hit && isFixedPoint(d, hit)) {
+        d.drag = null;
+        toast("⚓ Точка закреплена — снимите закрепление, чтобы двигать");
+      } else {
+        if (hit) keepStep(d);
+        d.drag = hit && { ...hit, orig: d.profiles[hit.i] };
+      }
       renderProps();
     } else if (type === "move" && d.drag) {
       d.profiles[d.drag.i] = moveHandle(d.drag.orig, d.drag.h, p);
     } else if (type === "up" && d.drag) {
+      // Касание без движения — не шаг истории
+      if (d.undo.length && JSON.parse(d.undo[d.undo.length - 1]).profiles[d.drag.i] && JSON.stringify(d.profiles[d.drag.i]) === JSON.stringify(d.drag.orig)) d.undo.pop();
       d.drag = null;
       renderProps();
     }
@@ -1256,15 +1365,23 @@ view.onSketch = (type, p0, hot, raw, snap) => {
     if (type === "up") addConstraintTap(d, raw);
   } else if (d.tool === "dim") {
     if (type === "up") {
-      const hit = nearestHandle(d, raw);
+      const hit = nearestHandle(d, raw, 14);
       const line = !hit && d.dimFirst ? nearestRefLine(d, raw) : null;
       if (hit) {
         d.dimFirst = hit;
         status("Теперь коснитесь ребра тела или оси (зелёные линии)");
       } else if (line && d.dimFirst) {
-        d.refDims.push({ ...d.dimFirst, ref: line });
+        keepStep(d);
+        const r: RefDim = { ...d.dimFirst, ref: line };
+        r.v = +(refDimGeom(d, r)?.dist ?? 0).toFixed(4);
+        d.refDims.push(r);
         d.dimFirst = null;
-      } else toast("Коснитесь точки эскиза, затем зелёной линии");
+      } else {
+        d.dimFirst = null;
+        const ent = pickEntity(d.profiles, raw, 18 / view.pxPerUnit(), ["line", "circle"]);
+        if (ent) addDim(d, ent);
+        else toast("Коснитесь отрезка или окружности — появится размер. Точка, затем зелёная линия — размер до ребра");
+      }
     }
   } else if (d.tool === "line") {
     if (type === "up") {
@@ -1274,6 +1391,7 @@ view.onSketch = (type, p0, hot, raw, snap) => {
         commitProfile({ kind: "poly", pts: d.poly }, true);
         d.poly = [];
       } else if (!last || dist2(p, last) > 1e-9) {
+        keepStep(d);
         if (auto && last) d.pend.push({ kind: auto.kind, seg: d.poly.length - 1, ref: auto.ref });
         d.poly.push(p);
       }
@@ -1314,13 +1432,21 @@ function addConstraintTap(d: Draft, raw: V2) {
   let kinds = d.conFirst ? def.second : def.first;
   // Касание: к отрезку — окружность, к окружности — отрезок или окружность
   if (d.conKind === "tangent" && d.conFirst) kinds = d.conFirst.t === "line" ? ["circle"] : ["circle", "line"];
-  const hit = pickEntity(d.profiles, raw, tol, kinds);
+  // Равенство: отрезок — с отрезком, окружность — с окружностью
+  if (d.conKind === "equal" && d.conFirst) kinds = [d.conFirst.t];
+  // Начало координат и оси — для связей, где второй элемент может быть опорным
+  const withOrigin = ["parallel", "perpendicular", "collinear", "tangent", "coincident", "onLine"].includes(d.conKind);
+  const hit = pickEntity(d.profiles, raw, tol, kinds, withOrigin);
   if (!hit) return toast(def.hint);
   if (!def.second.length) {
-    // Связь одного элемента (горизонталь/вертикаль)
+    if (hit.i === ORIGIN) return toast(def.hint);
+    // Связь одного элемента (горизонталь, вертикаль, закрепление)
+    if (d.conKind === "fix" && isFixedPoint(d, { i: hit.i, h: hit.e })) return toast("Точка уже закреплена");
+    keepStep(d);
     const c: Constraint = { kind: d.conKind, a: hit, b: hit };
-    prepareProfiles(d.profiles, c);
-    d.constraints.push(c);
+    if (c.kind === "fix") c.p = [...handles(d.profiles[hit.i])[hit.e]] as V2;
+    d.constraints.push(...prepareProfiles(d.profiles, c), c);
+    haptic("tick");
     return renderProps();
   }
   if (!d.conFirst) {
@@ -1331,10 +1457,26 @@ function addConstraintTap(d: Draft, raw: V2) {
   const a = d.conFirst;
   d.conFirst = null;
   if (a.i === hit.i && a.e === hit.e && a.t === hit.t) return toast("Нужны два разных элемента");
+  if (a.i === ORIGIN && hit.i === ORIGIN) return toast("Нужен хотя бы один элемент эскиза");
+  keepStep(d);
   const c: Constraint = { kind: d.conKind, a, b: hit };
-  prepareProfiles(d.profiles, c);
-  d.constraints.push(c);
+  d.constraints.push(...prepareProfiles(d.profiles, c), c);
+  haptic("tick");
   renderProps();
+}
+
+/** Точка закреплена связью «Закрепить» */
+function isFixedPoint(d: Draft, r: { i: number; h: number }) {
+  return d.constraints.some((c) => c.kind === "fix" && c.a.i === r.i && c.a.e === r.h);
+}
+
+function toggleFix(d: Draft, i: number, h: number) {
+  keepStep(d);
+  const k = d.constraints.findIndex((c) => c.kind === "fix" && c.a.i === i && c.a.e === h);
+  if (k >= 0) d.constraints.splice(k, 1);
+  else d.constraints.push({ kind: "fix", a: { i, e: h, t: "pt" }, b: { i, e: h, t: "pt" }, p: [...handles(d.profiles[i])[h]] as V2 });
+  renderProps();
+  drawDraft();
 }
 
 function stepBack() {
@@ -1342,10 +1484,11 @@ function stepBack() {
   if (!d) return;
   if (d.slotLine) d.slotLine = null;
   else if (d.start) d.start = null;
+  else if (d.undo.length) restoreSnap(d, d.undo.pop()!);
   else if (d.poly.length) {
     d.poly.pop();
     d.pend = d.pend.filter((pc) => pc.seg < d.poly.length - 1);
-  } else if (d.profiles.length) removeProfileAt(d.profiles.length - 1);
+  } else return toast("Нечего отменять");
   renderProps();
   drawDraft();
 }
@@ -2274,15 +2417,20 @@ function renderPointSection(root: HTMLElement, d: Draft) {
   const q = handles(p)[h];
   if (!q) return;
   const set = (np: Profile) => {
+    keepStep(d);
     d.profiles[i] = np;
     renderProps();
     drawDraft();
   };
+  const fixed = isFixedPoint(d, { i, h });
   root.append(
     el("h3", { textContent: `Точка — ${PROFILE_NAMES[p.kind].toLowerCase()} ${i + 1}` }),
     numberField("X", q[0], (v) => set(moveHandle(p, h, [v, q[1]]))),
     numberField("Y", q[1], (v) => set(moveHandle(p, h, [q[0], v]))),
-    buttonRow([p.kind === "poly" || (p.kind === "rect" && h < 4) ? "Удалить точку" : "Удалить фигуру", deleteSelectedPoint]),
+    buttonRow(
+      [fixed ? "⚓ Открепить" : "⚓ Закрепить", () => toggleFix(d, i, h)],
+      [p.kind === "poly" || (p.kind === "rect" && h < 4) ? "Удалить точку" : "Удалить фигуру", deleteSelectedPoint],
+    ),
   );
   if (isCorner(p, h)) {
     const cur = (p.kind === "rect" || p.kind === "poly" ? p.radii?.[h] : 0) ?? 0;
@@ -2305,7 +2453,7 @@ function toggleOrtho() {
 
 function renderConstraintSection(root: HTMLElement, d: Draft) {
   const grid = el("div", { className: "con-grid" });
-  for (const c of CONSTRAINTS) {
+  for (const c of CONSTRAINTS.filter((x) => !x.dim)) {
     const b = el("button", { className: d.conKind === c.kind ? "on" : "", title: c.hint }, el("span", { className: "ico", textContent: c.glyph }), c.label);
     b.addEventListener("click", () => {
       d.conKind = c.kind;
@@ -2322,13 +2470,33 @@ function renderConstraintSection(root: HTMLElement, d: Draft) {
     const def = CONSTRAINTS.find((x) => x.kind === c.kind)!;
     const del = el("button", { textContent: "✕", title: "Удалить связь" });
     del.addEventListener("click", () => {
+      keepStep(d);
       d.constraints.splice(k, 1);
       renderProps();
       drawDraft();
     });
-    const who = sameEnt(c.a, c.b) ? `фигура ${c.a.i + 1}` : `фигуры ${c.a.i + 1} и ${c.b.i + 1}`;
-    root.append(el("div", { className: "prof" }, el("div", { className: "prof-head" }, `${def.glyph} ${def.label}: ${who}${c.auto ? " · авто" : ""}`, del)));
+    const who = sameEnt(c.a, c.b) ? entName(c.a) : `${entName(c.a)} и ${entName(c.b)}`;
+    const val = c.v !== undefined ? ` = ${c.kind === "diameter" ? "Ø" : ""}${fmt(c.v)}` : "";
+    root.append(el("div", { className: "prof" }, el("div", { className: "prof-head" }, `${def.glyph} ${def.label}${val}: ${who}${c.auto ? " · авто" : ""}`, del)));
   });
+}
+
+/** Нанесённые размеры с удалением */
+function renderDimSection(root: HTMLElement, d: Draft) {
+  const list = d.constraints.map((c, k) => ({ c, k })).filter(({ c }) => c.kind === "length" || c.kind === "diameter");
+  if (!list.length) return;
+  root.append(el("h3", { textContent: `Размеры (${list.length})` }));
+  for (const { c, k } of list) {
+    const del = el("button", { textContent: "✕", title: "Удалить размер" });
+    del.addEventListener("click", () => {
+      keepStep(d);
+      d.constraints.splice(k, 1);
+      renderProps();
+      drawDraft();
+    });
+    const text = c.kind === "length" ? `↔ ${fmt(c.v ?? 0)} мм — отрезок, ${entName(c.a)}` : `Ø ${fmt(c.v ?? 0)} мм — ${entName(c.a)}`;
+    root.append(el("div", { className: "prof" }, el("div", { className: "prof-head" }, text, del)));
+  }
 }
 
 function renderSketchPanel(root: HTMLElement) {
@@ -2355,12 +2523,13 @@ function renderSketchPanel(root: HTMLElement) {
   });
   root.append(el("div", { className: "row" }, orthoBtn, autoBtn));
   if (d.tool === "line") root.append(buttonRow(["Замкнуть", closePoly], ["↶ Шаг назад", stepBack]));
-  else if (d.tool !== "select" && d.tool !== "dim") root.append(buttonRow(["↶ Шаг назад", stepBack]));
+  else root.append(buttonRow(["↶ Шаг назад", stepBack]));
   if (d.tool === "dim" && d.refDims.length) {
     root.append(
       buttonRow([
         `Убрать размеры до граней (${d.refDims.length})`,
         () => {
+          keepStep(d);
           d.refDims = [];
           renderProps();
           drawDraft();
@@ -2370,11 +2539,13 @@ function renderSketchPanel(root: HTMLElement) {
   }
   if (d.tool === "select" && d.sel && d.profiles[d.sel.i]) renderPointSection(root, d);
   if (d.tool === "constraint") renderConstraintSection(root, d);
+  if (d.tool === "dim") renderDimSection(root, d);
 
   root.append(el("h3", { textContent: `Профили (${d.profiles.length})` }));
   d.profiles.forEach((p, i) => {
     const del = el("button", { textContent: "✕", title: "Удалить" });
     del.addEventListener("click", () => {
+      keepStep(d);
       removeProfileAt(i);
       renderProps();
       drawDraft();
@@ -2382,6 +2553,7 @@ function renderSketchPanel(root: HTMLElement) {
     const box = el("div", { className: "prof" }, el("div", { className: "prof-head" }, `${PROFILE_NAMES[p.kind]} ${i + 1}`, del));
     box.append(
       ...profileFields(p, (np) => {
+        keepStep(d);
         d.profiles[i] = np;
         renderProps();
         drawDraft();

@@ -149,6 +149,11 @@ function openPad(input: HTMLInputElement) {
     // pointerdown + preventDefault: поле не теряет фокус при нажатии клавиши
     b.addEventListener("pointerdown", (e) => {
       e.preventDefault();
+      // Нажатие видно: клавиша «утапливается» (preventDefault гасит :active на части устройств)
+      b.classList.remove("pressed");
+      void b.offsetWidth;
+      b.classList.add("pressed");
+      setTimeout(() => b.classList.remove("pressed"), 160);
       press(key);
     });
     grid.append(b);
