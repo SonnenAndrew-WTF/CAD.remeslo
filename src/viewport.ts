@@ -109,6 +109,32 @@ const CUBE_FACES: { n: Vec3; up: Vec3; label: string }[] = [
 
 const v3 = (a: Vec3) => new THREE.Vector3(...a);
 
+/**
+ * Освободить видеопамять объекта и всех его потомков. Без этого каждая перерисовка
+ * черновика/предпросмотра оставляет буферы на GPU, и на планшете WebGL в итоге
+ * сбрасывается (холст становится белым). Повторно использованный после dispose
+ * материал или геометрия просто загрузятся заново.
+ */
+function disposeTree(o: THREE.Object3D) {
+  o.traverse((c) => {
+    const m = c as THREE.Mesh;
+    // Подсветка граней берёт буфер координат у тела — его освобождает само тело
+    if (c.userData.sharedPos) m.geometry?.deleteAttribute("position");
+    m.geometry?.dispose();
+    const mat = m.material as THREE.Material | THREE.Material[] | undefined;
+    if (Array.isArray(mat)) mat.forEach((x) => x.dispose());
+    else mat?.dispose();
+  });
+}
+
+/** Убрать всех потомков группы с освобождением памяти */
+function clearGroup(g: THREE.Object3D) {
+  for (const c of [...g.children]) {
+    g.remove(c);
+    disposeTree(c);
+  }
+}
+
 /** Матрица, переводящая локальные координаты эскиза (u, v, 0) в мировые */
 function planeMatrix(pl: SketchPlane, lift = 0) {
   const o = v3(pl.origin).addScaledVector(v3(pl.normal), lift);
@@ -137,6 +163,12 @@ export class Viewport {
   onScaleEnd: (bodyId: number, factors: Vec3) => void = () => {};
   /** Тело получилось слишком детальным для сетки (предупреждение о пределах) */
   onHeavyMesh: (bodyName: string, triangles: number) => void = () => {};
+  /** WebGL сброшен системой (нехватка видеопамяти) и восстановлен — пересобрать сцену */
+  onContextRestored: () => void = () => {};
+  onContextLost: () => void = () => {};
+  /** Группы тел и эскизов, показанные в прошлый раз, — неиспользуемые освобождаем */
+  private shownBodies = new Map<Body, THREE.Group>();
+  private shownSketches = new Map<Sketch, THREE.Group>();
   /** Ограничение масштаба по телу: свободно по осям, X=Y (цилиндр) или только равномерно */
   scaleRule: (bodyId: number) => "free" | "xy" | "uniform" = () => "uniform";
   onDimEdit: (id: string, label: HTMLElement) => void = () => {};
@@ -230,6 +262,18 @@ export class Viewport {
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setClearColor(this.palette.bg);
     container.appendChild(this.renderer.domElement);
+    // Android может сбросить WebGL (видеопамять, сворачивание приложения). Three.js
+    // восстанавливает контекст сам, если отменить действие по умолчанию; содержимое
+    // сцены после этого загружаем на GPU заново
+    this.renderer.domElement.addEventListener("webglcontextlost", (e) => {
+      e.preventDefault();
+      this.onContextLost();
+    });
+    this.renderer.domElement.addEventListener("webglcontextrestored", () => {
+      this.renderer.setClearColor(this.palette.bg);
+      this.dropCaches();
+      this.onContextRestored();
+    });
 
     // CAD-соглашение: ось Z смотрит вверх, единицы — миллиметры
     this.persp = new THREE.PerspectiveCamera(40, 1, 0.5, 20000);
@@ -358,13 +402,22 @@ export class Viewport {
     this.palette = PALETTES[theme];
     this.renderer.setClearColor(this.palette.bg);
     this.scene.remove(this.grid);
+    disposeTree(this.grid);
     this.grid = makeGrid(400, 40, this.palette.grid);
     this.grid.visible = !this.sketchPlane;
     this.scene.add(this.grid);
     // Эскизы и тела строятся с цветами темы — сбрасываем кэш
+    this.dropCaches();
+    if (this.sketchPlane) this.buildSketchGrid(this.sketchPlane);
+  }
+
+  /** Забыть построенные группы тел и эскизов (тема сменилась или WebGL восстановлен) */
+  private dropCaches() {
+    for (const g of [...this.shownBodies.values(), ...this.shownSketches.values()]) disposeTree(g);
+    this.shownBodies.clear();
+    this.shownSketches.clear();
     this.sketchCache = new WeakMap();
     this.cache = new WeakMap();
-    if (this.sketchPlane) this.buildSketchGrid(this.sketchPlane);
   }
 
   get projection(): Projection {
@@ -848,7 +901,7 @@ export class Viewport {
 
   /** Предпросмотр создаваемой плоскости */
   setPlanePreview(pl: SketchPlane | null) {
-    this.planePreview.clear();
+    clearGroup(this.planePreview);
     if (pl) this.planePreview.add(this.buildPlane(pl, 0xffb02e, 0.22));
   }
 
@@ -878,6 +931,7 @@ export class Viewport {
         }),
       );
       m.userData[tag] = true;
+      m.userData.sharedPos = true;
       g.add(m);
     }
     const eg = (g.userData.edgeGroups as (Groups[number] & { edgeId: number })[]).filter((e) => edges.includes(e.edgeId));
@@ -893,7 +947,13 @@ export class Viewport {
   }
 
   private removeTagged(tag: "hl" | "hover") {
-    for (const g of this.groups.values()) g.children.filter((c) => c.userData[tag]).forEach((c) => g.remove(c));
+    for (const g of this.groups.values())
+      g.children
+        .filter((c) => c.userData[tag])
+        .forEach((c) => {
+          g.remove(c);
+          disposeTree(c);
+        });
   }
 
   /** Подсветка выбранных граней и рёбер одного тела */
@@ -1039,7 +1099,7 @@ export class Viewport {
     planes: RefPlane[] = [],
     selPlaneId: number | null = null,
   ) {
-    this.planeRoot.clear();
+    clearGroup(this.planeRoot);
     for (const rp of planes) {
       const sel = rp.id === selPlaneId;
       const g = this.buildPlane(rp.plane, sel ? 0xffb02e : 0x5b95ff, sel ? 0.25 : 0.1);
@@ -1050,12 +1110,14 @@ export class Viewport {
     this.hoverKey = "";
     this.groups.clear();
     this.bodiesRoot.clear();
+    const usedBodies = new Map<Body, THREE.Group>();
     for (const b of bodies) {
       let g = this.cache.get(b);
       if (!g) {
         g = this.build(b);
         this.cache.set(b, g);
       }
+      usedBodies.set(b, g);
       g.position.copy(g.userData.center);
       const mat = (g.children[0] as THREE.Mesh).material as THREE.MeshStandardMaterial;
       const order = selection.indexOf(b.id);
@@ -1068,6 +1130,7 @@ export class Viewport {
     }
 
     this.sketchRoot.clear();
+    const usedSketches = new Map<Sketch, THREE.Group>();
     for (const sk of sketches) {
       if (sk.id === hideSketchId) continue;
       let g = this.sketchCache.get(sk);
@@ -1075,6 +1138,7 @@ export class Viewport {
         g = this.buildSketch(sk);
         this.sketchCache.set(sk, g);
       }
+      usedSketches.set(sk, g);
       g.children.forEach((c) => {
         if (!c.userData.fill) return;
         const u = c.userData;
@@ -1087,6 +1151,13 @@ export class Viewport {
       });
       this.sketchRoot.add(g);
     }
+
+    // Тела и эскизы, которых больше нет на сцене (изменены, удалены, скрыты), освобождают
+    // видеопамять; при возврате (отмена) группа построится заново
+    for (const [b, g] of this.shownBodies) if (usedBodies.get(b) !== g) (disposeTree(g), this.cache.delete(b));
+    for (const [sk, g] of this.shownSketches) if (usedSketches.get(sk) !== g) (disposeTree(g), this.sketchCache.delete(sk));
+    this.shownBodies = usedBodies;
+    this.shownSketches = usedSketches;
 
     this.applyXray();
     this.hoverBodyId = null;
@@ -1124,7 +1195,10 @@ export class Viewport {
   // ---------- режим эскиза ----------
 
   private buildSketchGrid(pl: SketchPlane) {
-    if (this.sketchGrid) this.scene.remove(this.sketchGrid);
+    if (this.sketchGrid) {
+      this.scene.remove(this.sketchGrid);
+      disposeTree(this.sketchGrid);
+    }
     const holder = new THREE.Group();
     holder.matrixAutoUpdate = false;
     holder.matrix.copy(planeMatrix(pl, 0.02));
@@ -1170,10 +1244,13 @@ export class Viewport {
     this.applyXray();
     this.orbit.enableRotate = !this.boxSelect;
     this.updateTouchMap();
-    if (this.sketchGrid) this.scene.remove(this.sketchGrid);
+    if (this.sketchGrid) {
+      this.scene.remove(this.sketchGrid);
+      disposeTree(this.sketchGrid);
+    }
     this.sketchGrid = null;
     this.grid.visible = true;
-    this.draftRoot.clear();
+    clearGroup(this.draftRoot);
     this.setDimLabels([]);
   }
 
@@ -1235,7 +1312,7 @@ export class Viewport {
   /** Черновик эскиза: контуры, ломаные, маркер привязки, ручки точек, опорные линии и размеры */
   setDraft(v: DraftView) {
     const pl = this.sketchPlane;
-    this.draftRoot.clear();
+    clearGroup(this.draftRoot);
     if (!pl) return this.setDimLabels([]);
     const m = planeMatrix(pl, 0.1);
     const add = (o: THREE.Object3D) => {
@@ -1596,7 +1673,7 @@ export class Viewport {
    * (скругление: полупрозрачный результат поверх оригинала был бы неразличим).
    */
   setPreview(shape: Shape | null, color = 0x4c8dff, opts: { opaque?: boolean; hideBodyId?: number } = {}) {
-    this.previewRoot.clear();
+    clearGroup(this.previewRoot);
     this.hiddenBodyId = shape ? (opts.hideBodyId ?? null) : null;
     for (const [id, g] of this.groups) g.visible = id !== this.hiddenBodyId;
     if (!shape) return;

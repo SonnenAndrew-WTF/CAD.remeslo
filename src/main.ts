@@ -119,6 +119,16 @@ function run(label: string, fn: () => void, failHint?: string) {
   if (dt > SLOW_OP_MS) warn(`${label} заняла ${(dt / 1000).toFixed(1)} с — геометрия сложная для ядра, дальше операции будут медленнее`);
 }
 
+// Отладка в режиме разработки: window.__view.renderer.info — расход видеопамяти
+if (import.meta.env.DEV) (window as unknown as { __view: Viewport }).__view = view;
+
+view.onContextLost = () => toast("Видеопамять переполнена — восстанавливаю картинку…", true);
+view.onContextRestored = () => {
+  refresh();
+  if (draft) drawDraft();
+  toast("Картинка восстановлена");
+};
+
 view.onHeavyMesh = (name, tris) =>
   warn(`«${name}»: ${Math.round(tris / 1000)} тыс. треугольников — тело тяжёлое для планшета; упростите скругления или разбейте на части`);
 
