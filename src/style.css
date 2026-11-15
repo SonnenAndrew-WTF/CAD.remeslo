@@ -649,3 +649,8 @@ button.primary.danger { background: var(--danger); }
 .onboard-card .dots span.on { background: var(--accent); box-shadow: none; }
 /* Во время эскиза шкала истории закрывала бы холст */
 #app.sketching #timeline { display: none !important; }
+
+/* Отклик нажатия для всех кнопок: лёгкое «утапливание» */
+button { transition: transform .12s ease, box-shadow .12s ease, filter .12s ease; }
+button:not(:disabled):active,
+button.pressed:not(:disabled) { transform: scale(0.94); box-shadow: var(--pressed-sm); filter: brightness(0.95); }

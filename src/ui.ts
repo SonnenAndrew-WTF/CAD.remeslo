@@ -232,6 +232,30 @@ export function installNumpad() {
   document.addEventListener("input", (e) => e.target === target && preview());
 }
 
+// ---------- отклик кнопок ----------
+
+/**
+ * Любая кнопка при нажатии «утапливается». Класс ставится по pointerdown: на пере и пальце
+ * :active срабатывает не всегда (часть кнопок отменяет действие по умолчанию, чтобы не терять фокус).
+ * Подписи размеров позиционируются через transform — их не трогаем.
+ */
+export function installPressAnimation() {
+  document.addEventListener(
+    "pointerdown",
+    (e) => {
+      const b = (e.target as Element | null)?.closest?.("button");
+      if (!b || (b as HTMLButtonElement).disabled || b.style.transform) return;
+      b.classList.remove("pressed");
+      void b.offsetWidth;
+      b.classList.add("pressed");
+      const up = () => setTimeout(() => b.classList.remove("pressed"), 90);
+      window.addEventListener("pointerup", up, { once: true });
+      window.addEventListener("pointercancel", up, { once: true });
+    },
+    true,
+  );
+}
+
 // ---------- диалоги ----------
 
 function modal(build: (box: HTMLDivElement, close: () => void) => void) {

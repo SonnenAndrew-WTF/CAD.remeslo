@@ -25,7 +25,7 @@ import { Viewport, type Dim, type Pick, type PickMode, type ProfileRef, type Sub
 import * as K from "./kernel";
 import type { Primitive } from "./kernel";
 import * as S from "./storage";
-import { evalExpr, haptic, installNumpad, isTouchLike, uiConfirm, uiPrompt } from "./ui";
+import { evalExpr, haptic, installNumpad, installPressAnimation, isTouchLike, uiConfirm, uiPrompt } from "./ui";
 import { Capacitor } from "@capacitor/core";
 import { Directory, Filesystem } from "@capacitor/filesystem";
 import { Share } from "@capacitor/share";
@@ -3533,6 +3533,7 @@ applyTheme((getPref("theme") as Theme | null) ?? (prefersDark ? "dark" : "light"
 setLeftHand(getPref("leftHand") === "1");
 setPanelCollapsed(getPref("panel") === "0");
 installNumpad();
+installPressAnimation();
 renderToolbar();
 applySnap(getPref("snap") !== "0");
 if (getPref("projection") === "ortho") view.setProjection("ortho");
