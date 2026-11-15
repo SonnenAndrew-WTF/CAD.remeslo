@@ -1213,12 +1213,15 @@ function addDim(d: Draft, ent: EntRef) {
   renderProps();
 }
 
+/** Связи эскиза нельзя выполнить все сразу */
+let sketchConflict = false;
+
 function drawDraft() {
   const d = draft;
   if (!d) return;
   // Связи восстанавливаются после любой правки; точка под пальцем остаётся на месте
-  if (d.constraints.length) solve(d.profiles, d.constraints, d.drag ? { i: d.drag.i, h: d.drag.h } : null);
-  applyRefDims(d);
+  // Все связи и размеры решаются вместе; точка под пальцем следует за ним, насколько позволяют связи
+  sketchConflict = !solve(d.profiles, d.constraints, d.drag ? { i: d.drag.i, h: d.drag.h } : null, d.refDims);
   const open: V2[][] = [];
   if (d.poly.length) open.push(d.cursor ? [...d.poly, d.cursor] : d.poly);
   if (d.stroke && d.stroke.length > 1) open.push(d.stroke);
@@ -1269,7 +1272,8 @@ function drawDraft() {
 
   // Живые размеры в строке состояния
   const autoName: Record<string, string> = { horizontal: "горизонтально", vertical: "вертикально", parallel: "параллельно", perpendicular: "перпендикулярно" };
-  if (d.tool === "dim" && d.dimFirst) status("Теперь коснитесь ребра тела или оси (зелёные линии)");
+  if (sketchConflict) status("⚠ Связи или размеры противоречат друг другу — уберите лишнюю (последнюю — «Шаг назад»)");
+  else if (d.tool === "dim" && d.dimFirst) status("Теперь коснитесь ребра тела или оси (зелёные линии)");
   else if (d.autoHint && d.poly.length && d.cursor)
     status(`Авто: ${autoName[d.autoHint.kind]} · отрезок ${fmt(dist2(d.poly[d.poly.length - 1], d.cursor))} мм`);
   else if (d.snapKind && d.cursor && !pend) status(`Привязка: ${d.snapKind} · X ${fmt(d.cursor[0])} Y ${fmt(d.cursor[1])}`);
@@ -1433,6 +1437,8 @@ view.onSketch = (type, p0, hot, raw, snap) => {
     d.pressStarted = false;
   }
   drawDraft();
+  // Решатель мог сдвинуть фигуры — числа в панели должны совпадать с картинкой
+  if (type === "up") renderProps();
 };
 
 /** Касание в инструменте «Связи»: первый элемент, затем второй — связь создаётся */

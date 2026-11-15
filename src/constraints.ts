@@ -1,8 +1,6 @@
-// Геометрические связи эскиза и простой итеративный решатель.
-// Каждая связь «проецирует» один из элементов так, чтобы условие выполнялось;
-// несколько проходов по всем связям сходятся для типичных эскизов.
+// Геометрические связи эскиза и численный решатель (все связи одновременно).
 // Размеры (длина, диаметр) — тоже связи: перетаскивание точек их не меняет.
-import { closestOnSegment, dist2, footOnLine, handles, moveHandle, segments, type Profile, type V2 } from "./sketch";
+import { closestOnSegment, dist2, handles, segments, type Profile, type V2 } from "./sketch";
 
 export type EntKind = "pt" | "line" | "circle";
 /** Элемент эскиза: профиль i, номер элемента e (точка-ручка, сторона или окружность) */
@@ -81,7 +79,6 @@ const mul = (a: V2, k: number): V2 => [a[0] * k, a[1] * k];
 const len = (a: V2) => Math.hypot(a[0], a[1]);
 const norm = (a: V2): V2 => mul(a, 1 / (len(a) || 1));
 const dot = (a: V2, b: V2) => a[0] * b[0] + a[1] * b[1];
-const perp = (a: V2): V2 => [-a[1], a[0]];
 
 // ---------- элементы профилей ----------
 
@@ -113,23 +110,9 @@ export function lineOf(ps: Profile[], r: EntRef): [V2, V2] {
 }
 const circOf = (ps: Profile[], r: EntRef) => (r.i === ORIGIN ? null : circleOf(ps[r.i]));
 
-/** Номер точки-ручки в конце отрезка e (у замкнутого контура последний отрезок идёт в точку 0) */
-function endIdx(p: Profile, e: number) {
-  return p.kind === "poly" || p.kind === "rect" ? (e + 1) % lines(p).length : e + 1;
-}
-
 /** Прямоугольник с наклонной стороной уже не прямоугольник — переводим в многоугольник */
 export function toPoly(p: Profile): Profile {
   return p.kind === "rect" ? { kind: "poly", pts: handles(p).slice(0, 4), radii: p.radii } : p;
-}
-
-function setLine(p: Profile, e: number, a: V2, b: V2): Profile {
-  if (p.kind === "axis") return { ...p, a, b };
-  if (p.kind !== "poly" && p.kind !== "path") return p;
-  const pts = [...p.pts];
-  pts[e] = a;
-  pts[(e + 1) % pts.length] = b;
-  return { ...p, pts };
 }
 
 /** Ближайший к точке элемент нужного типа в пределах tol; withOrigin — и начало координат/оси */
@@ -188,174 +171,282 @@ export function isValidRef(profiles: Profile[], r: EntRef): boolean {
 }
 
 // ---------- решатель ----------
+//
+// Все связи решаются одновременно (метод Левенберга — Марквардта): переменные — параметры
+// фигур (углы ломаных, центр и радиус окружности, x/y/ширина/высота прямоугольника…),
+// каждая связь — одно-два уравнения «невязка = 0». Перетаскиваемая точка тянется к пальцу
+// слабее, чем действуют связи: если связи не дают ей двигаться, она остаётся на месте.
 
-/** Перетаскиваемая точка (профиль i, ручка h) — неподвижна для решателя */
+/** Перетаскиваемая точка (профиль i, ручка h) */
 export type Fixed = { i: number; h: number } | null;
-type FixedList = { i: number; h: number }[];
 
-function touchesFixed(ps: Profile[], r: EntRef, fixed: FixedList): boolean {
-  if (r.i === ORIGIN) return true;
-  const p = ps[r.i];
-  return fixed.some((f) => {
-    if (f.i !== r.i) return false;
-    if (r.t === "pt") return r.e === f.h;
-    if (r.t === "line") return f.h === r.e || f.h === endIdx(p, r.e);
-    return f.h === 0;
-  });
+/** Размер «точка — ребро/ось» со значением — тоже уравнение решателя */
+export interface RefDimEq {
+  i: number;
+  h: number;
+  ref: [V2, V2];
+  v?: number;
 }
 
-/** Повернуть отрезок вокруг середины в направлении dir (выбирая ближайший из ±dir) */
-function alignLine([a, b]: [V2, V2], dir: V2): [V2, V2] {
-  const m = mul(add(a, b), 0.5);
-  const half = len(sub(b, a)) / 2;
-  const d = dot(sub(b, a), dir) >= 0 ? dir : mul(dir, -1);
-  return [sub(m, mul(d, half)), add(m, mul(d, half))];
-}
-
-/** Задать длину отрезку: конец под пальцем (или закреплённый) остаётся на месте */
-function setLength(ps: Profile[], mov: EntRef, L: number, fixed: FixedList) {
-  const P = ps[mov.i];
-  if (P.kind === "rect") {
-    // Стороны 0 и 2 — ширина, 1 и 3 — высота; угол (x, y) на месте
-    ps[mov.i] = mov.e % 2 === 0 ? { ...P, w: L } : { ...P, h: L };
-    return;
+/** Параметры фигуры как массив чисел и обратно */
+function params(p: Profile): number[] {
+  switch (p.kind) {
+    case "rect":
+      return [p.x, p.y, p.w, p.h];
+    case "circle":
+      return [p.cx, p.cy, p.r];
+    case "ellipse":
+      return [p.cx, p.cy, p.rx, p.ry];
+    case "slot":
+      return [...p.a, ...p.b, p.r];
+    case "axis":
+      return [...p.a, ...p.b];
+    case "poly":
+    case "path":
+      return p.pts.flat();
+    default:
+      return [];
   }
-  const [a, b] = lines(P)[mov.e];
-  const keepB = fixed.some((f) => f.i === mov.i && f.h === endIdx(P, mov.e)) && !fixed.some((f) => f.i === mov.i && f.h === mov.e);
-  const d = norm(sub(b, a));
-  if (len(sub(b, a)) < 1e-12) return;
-  ps[mov.i] = keepB ? setLine(P, mov.e, sub(b, mul(d, L)), b) : setLine(P, mov.e, a, add(a, mul(d, L)));
 }
 
-/** Одна проекция: меняет «подвижный» элемент; возвращает величину изменения */
-function applyOne(ps: Profile[], c: Constraint, fixed: FixedList): number {
-  // По умолчанию двигаем второй элемент; если он под пальцем/закреплён — первый
-  let [ref, mov] = [c.a, c.b];
-  if (touchesFixed(ps, mov, fixed) && !touchesFixed(ps, ref, fixed)) [ref, mov] = [mov, ref];
-  if (c.kind === "onLine" && !touchesFixed(ps, c.a, fixed)) [ref, mov] = [c.b, c.a]; // точка идёт к линии
-  // Касание окружности и отрезка: двигаем окружность — сдвиг стороны ломал бы контур
-  if (c.kind === "tangent" && c.a.t !== c.b.t) {
-    const circle = c.a.t === "circle" ? c.a : c.b;
-    const line = circle === c.a ? c.b : c.a;
-    [ref, mov] = touchesFixed(ps, circle, fixed) ? [circle, line] : [line, circle];
+function withParams(p: Profile, v: number[], o: number): Profile {
+  switch (p.kind) {
+    case "rect":
+      return { ...p, x: v[o], y: v[o + 1], w: v[o + 2], h: v[o + 3] };
+    case "circle":
+      return { ...p, cx: v[o], cy: v[o + 1], r: v[o + 2] };
+    case "ellipse":
+      return { ...p, cx: v[o], cy: v[o + 1], rx: v[o + 2], ry: v[o + 3] };
+    case "slot":
+      return { ...p, a: [v[o], v[o + 1]], b: [v[o + 2], v[o + 3]], r: v[o + 4] };
+    case "axis":
+      return { ...p, a: [v[o], v[o + 1]], b: [v[o + 2], v[o + 3]] };
+    case "poly":
+    case "path":
+      return { ...p, pts: p.pts.map((_, k) => [v[o + 2 * k], v[o + 2 * k + 1]] as V2) };
+    default:
+      return p;
   }
-  // Начало координат неподвижно
-  if (mov.i === ORIGIN) [ref, mov] = [mov, ref];
-  if (mov.i === ORIGIN) return 0;
-  const before = JSON.stringify(ps[mov.i]);
-  const P = ps[mov.i];
+}
 
+const cross2 = (a: V2, b: V2) => a[0] * b[1] - a[1] * b[0];
+/** Расстояние со знаком от точки до прямой ab */
+const sdist = (p: V2, a: V2, b: V2) => cross2(sub(b, a), sub(p, a)) / (len(sub(b, a)) || 1e-12);
+
+/** Невязки связи (в мм): все нули — связь выполнена */
+function residuals(ps: Profile[], c: Constraint, out: number[]) {
   switch (c.kind) {
-    case "fix":
-      if (c.p) ps[mov.i] = moveHandle(P, mov.e, c.p);
+    case "coincident": {
+      const p = ptOf(ps, c.a);
+      const q = ptOf(ps, c.b);
+      out.push(p[0] - q[0], p[1] - q[1]);
       break;
-    case "length":
-      if (c.v && c.v > 0) setLength(ps, mov, c.v, fixed);
+    }
+    case "fix": {
+      const p = ptOf(ps, c.a);
+      if (c.p) out.push(p[0] - c.p[0], p[1] - c.p[1]);
       break;
-    case "diameter":
-      if (P.kind === "circle" && c.v && c.v > 0) ps[mov.i] = { ...P, r: c.v / 2 };
+    }
+    case "onLine": {
+      const [a, b] = lineOf(ps, c.b);
+      out.push(sdist(ptOf(ps, c.a), a, b));
       break;
-    case "equal": {
-      if (mov.t === "circle") {
-        const cr = circOf(ps, ref);
-        if (cr && P.kind === "circle") ps[mov.i] = { ...P, r: cr.r };
-      } else {
-        const [ra, rb] = lineOf(ps, ref);
-        setLength(ps, mov, dist2(ra, rb), fixed);
-      }
+    }
+    case "parallel":
+    case "perpendicular": {
+      const [a1, b1] = lineOf(ps, c.a);
+      const [a2, b2] = lineOf(ps, c.b);
+      const d1 = sub(b1, a1);
+      const d2 = sub(b2, a2);
+      // Безразмерный угол умножаем на длину отрезка (не больше 100 мм) — невязка в мм
+      const L = Math.min(len(d1), len(d2), 100);
+      const n1 = norm(d1);
+      const n2 = norm(d2);
+      out.push((c.kind === "parallel" ? cross2(n1, n2) : dot(n1, n2)) * L);
+      break;
+    }
+    case "collinear": {
+      const [a1, b1] = lineOf(ps, c.a);
+      const [a2, b2] = lineOf(ps, c.b);
+      out.push(sdist(a2, a1, b1), sdist(b2, a1, b1));
       break;
     }
     case "horizontal":
     case "vertical": {
-      if (P.kind === "rect") break; // стороны прямоугольника и так по осям
-      // Выравниваем одну координату концов; конец под пальцем остаётся на месте
-      const k = c.kind === "horizontal" ? 1 : 0;
-      const [a, b] = lines(P)[mov.e];
-      const fa = fixed.some((f) => f.i === mov.i && f.h === mov.e);
-      const fb = fixed.some((f) => f.i === mov.i && f.h === endIdx(P, mov.e));
-      const v = fa ? a[k] : fb ? b[k] : (a[k] + b[k]) / 2;
-      const a2 = [...a] as V2;
-      const b2 = [...b] as V2;
-      a2[k] = b2[k] = v;
-      ps[mov.i] = setLine(P, mov.e, a2, b2);
+      const [a, b] = lineOf(ps, c.a);
+      out.push(c.kind === "horizontal" ? a[1] - b[1] : a[0] - b[0]);
       break;
     }
-    case "coincident":
-      ps[mov.i] = moveHandle(P, mov.e, ptOf(ps, ref));
-      break;
-    case "onLine": {
-      if (mov.t === "pt") {
-        const [a, b] = lineOf(ps, ref);
-        ps[mov.i] = moveHandle(P, mov.e, footOnLine(handles(P)[mov.e], a, b));
-      } else {
-        // Точка неподвижна — сдвигаем линию перпендикулярно, чтобы прошла через точку
-        const q = ptOf(ps, ref);
-        const [a, b] = lines(P)[mov.e];
-        const shift = sub(q, footOnLine(q, a, b));
-        ps[mov.i] = setLine(P, mov.e, add(a, shift), add(b, shift));
-      }
+    case "equal": {
+      if (c.a.t === "circle") {
+        const ca = circOf(ps, c.a);
+        const cb = circOf(ps, c.b);
+        if (ca && cb) out.push(ca.r - cb.r);
+      } else out.push(dist2(...lineOf(ps, c.a)) - dist2(...lineOf(ps, c.b)));
       break;
     }
-    case "parallel":
-    case "perpendicular":
-    case "collinear": {
-      const [ra, rb] = lineOf(ps, ref);
-      const along = norm(sub(rb, ra));
-      const dir = c.kind === "perpendicular" ? perp(along) : along;
-      let seg = alignLine(lines(P)[mov.e], dir);
-      if (c.kind === "collinear") {
-        const m = mul(add(seg[0], seg[1]), 0.5);
-        const shift = sub(footOnLine(m, ra, rb), m);
-        seg = [add(seg[0], shift), add(seg[1], shift)];
-      }
-      ps[mov.i] = setLine(P, mov.e, seg[0], seg[1]);
+    case "length":
+      if (c.v !== undefined) out.push(dist2(...lineOf(ps, c.a)) - c.v);
+      break;
+    case "diameter": {
+      const ca = circOf(ps, c.a);
+      if (ca && c.v !== undefined) out.push(2 * ca.r - c.v);
       break;
     }
     case "tangent": {
-      const cm = circleOf(P);
-      const cr = circOf(ps, ref);
-      if (cm && cr) {
-        // Две окружности: внешнее касание, а если одна внутри другой — внутреннее
-        const d = sub(cm.c, cr.c);
-        const inside = len(d) < Math.abs(cm.r - cr.r);
-        const target = inside ? Math.abs(cm.r - cr.r) : cm.r + cr.r;
-        const c2 = add(cr.c, mul(norm(len(d) ? d : [1, 0]), target));
-        ps[mov.i] = { ...(P as Extract<Profile, { kind: "circle" }>), cx: c2[0], cy: c2[1] };
-      } else if (cm && ref.t === "line") {
-        // Двигаем окружность перпендикулярно линии, сохраняя сторону
-        const [a, b] = lineOf(ps, ref);
-        const f = footOnLine(cm.c, a, b);
-        const n = len(sub(cm.c, f)) > 1e-9 ? norm(sub(cm.c, f)) : norm(perp(sub(b, a)));
-        const c2 = add(f, mul(n, cm.r));
-        ps[mov.i] = { ...(P as Extract<Profile, { kind: "circle" }>), cx: c2[0], cy: c2[1] };
-      } else if (cr && mov.t === "line") {
-        // Окружность неподвижна — сдвигаем линию до касания
-        const [a, b] = lines(P)[mov.e];
-        const f = footOnLine(cr.c, a, b);
-        const n = len(sub(f, cr.c)) > 1e-9 ? norm(sub(f, cr.c)) : norm(perp(sub(b, a)));
-        const shift = sub(add(cr.c, mul(n, cr.r)), f);
-        ps[mov.i] = setLine(P, mov.e, add(a, shift), add(b, shift));
+      const ca = c.a.t === "circle" ? circOf(ps, c.a) : null;
+      const cb = c.b.t === "circle" ? circOf(ps, c.b) : null;
+      if (ca && cb) {
+        const d = dist2(ca.c, cb.c);
+        // Внутреннее касание — если одна окружность внутри другой
+        out.push(d < Math.abs(ca.r - cb.r) ? d - Math.abs(ca.r - cb.r) : d - (ca.r + cb.r));
+      } else {
+        const circ = ca ?? cb;
+        const line = ca ? c.b : c.a;
+        if (circ) {
+          const [a, b] = lineOf(ps, line);
+          out.push(Math.abs(sdist(circ.c, a, b)) - circ.r);
+        }
       }
       break;
     }
   }
-  return before === JSON.stringify(ps[mov.i]) ? 0 : 1;
 }
 
-/** Закреплённые связью «Закрепить» точки — для решателя неподвижны, как точка под пальцем */
-export function fixedPoints(constraints: Constraint[]): FixedList {
-  return constraints.filter((c) => c.kind === "fix").map((c) => ({ i: c.a.i, h: c.a.e }));
-}
-
-/** Решить все связи на месте (до 40 проходов); fixed — точка под пальцем */
-export function solve(profiles: Profile[], constraints: Constraint[], fixed: Fixed = null) {
-  const valid = constraints.filter((c) => isValidRef(profiles, c.a) && isValidRef(profiles, c.b));
-  const list = [...fixedPoints(valid), ...(fixed ? [fixed] : [])];
-  for (let it = 0; it < 40; it++) {
-    let changed = 0;
-    for (const c of valid) changed += applyOne(profiles, c, list);
-    if (!changed) break;
+/** Решить систему A·x = b (Гаусс с выбором главного элемента); A портится */
+function linsolve(A: number[][], b: number[]): number[] | null {
+  const n = b.length;
+  for (let k = 0; k < n; k++) {
+    let piv = k;
+    for (let i = k + 1; i < n; i++) if (Math.abs(A[i][k]) > Math.abs(A[piv][k])) piv = i;
+    if (Math.abs(A[piv][k]) < 1e-14) return null;
+    [A[k], A[piv]] = [A[piv], A[k]];
+    [b[k], b[piv]] = [b[piv], b[k]];
+    for (let i = k + 1; i < n; i++) {
+      const f = A[i][k] / A[k][k];
+      if (!f) continue;
+      for (let j = k; j < n; j++) A[i][j] -= f * A[k][j];
+      b[i] -= f * b[k];
+    }
   }
+  const x = new Array(n).fill(0);
+  for (let i = n - 1; i >= 0; i--) {
+    let s = b[i];
+    for (let j = i + 1; j < n; j++) s -= A[i][j] * x[j];
+    x[i] = s / A[i][i];
+  }
+  return x;
+}
+
+const W_CON = 30; // вес связей
+const W_DRAG = 1; // палец тянет точку слабее, чем держат связи
+const W_REG = 0.02; // остальное по возможности остаётся на месте
+
+/**
+ * Решить связи на месте. fixed — точка под пальцем (её положение — желаемое, не обязательное).
+ * Возвращает false, если связи противоречат друг другу и выполнить все нельзя.
+ */
+export function solve(profiles: Profile[], constraints: Constraint[], fixed: Fixed = null, refDims: RefDimEq[] = []): boolean {
+  const cons = constraints.filter((c) => isValidRef(profiles, c.a) && isValidRef(profiles, c.b));
+  const rds = refDims.filter((r) => r.v !== undefined && profiles[r.i] && handles(profiles[r.i])[r.h]);
+  if (!cons.length && !rds.length) return true;
+  // Переменные — только фигуры, участвующие в связях
+  const used = new Set<number>();
+  for (const c of cons) for (const r of [c.a, c.b]) if (r.i !== ORIGIN) used.add(r.i);
+  for (const r of rds) used.add(r.i);
+  const idx = [...used].sort((a, b) => a - b);
+  const offs = new Map<number, number>();
+  const x0: number[] = [];
+  for (const i of idx) {
+    offs.set(i, x0.length);
+    x0.push(...params(profiles[i]));
+  }
+  const n = x0.length;
+  if (!n) return true;
+  const build = (x: number[]) => {
+    const ps = profiles.slice();
+    for (const i of idx) ps[i] = withParams(profiles[i], x, offs.get(i)!);
+    return ps;
+  };
+  const dragTarget = fixed && used.has(fixed.i) ? handles(profiles[fixed.i])[fixed.h] : null;
+
+  /** Все невязки: связи, размеры до граней, палец, «остаться на месте» */
+  const resid = (x: number[], withDrag: boolean, anchor: number[]) => {
+    const ps = build(x);
+    const r: number[] = [];
+    for (const c of cons) residuals(ps, c, r);
+    for (const d of rds) r.push(Math.abs(sdist(handles(ps[d.i])[d.h], d.ref[0], d.ref[1])) - d.v!);
+    const m = r.length;
+    for (let k = 0; k < m; k++) r[k] *= W_CON;
+    if (withDrag && dragTarget) {
+      const q = handles(ps[fixed!.i])[fixed!.h];
+      r.push(W_DRAG * (q[0] - dragTarget[0]), W_DRAG * (q[1] - dragTarget[1]));
+    }
+    for (let j = 0; j < n; j++) r.push(W_REG * (x[j] - anchor[j]));
+    return { r, m };
+  };
+
+  let x = x0.slice();
+  // Сначала с пальцем, потом без него — чтобы связи выполнились точно
+  for (const withDrag of dragTarget ? [true, false] : [false]) {
+    const anchor = x.slice();
+    let lambda = 1e-3;
+    let cur = resid(x, withDrag, anchor);
+    let cost = cur.r.reduce((s, v) => s + v * v, 0);
+    for (let it = 0; it < 60; it++) {
+      // Связи выполнены (с пальцем — ещё и точка дошла, насколько можно): дальше не уточняем
+      if (Math.max(0, ...cur.r.slice(0, cur.m).map(Math.abs)) < 1e-7 * W_CON && (!withDrag || it > 3)) break;
+      // Якобиан численно
+      const J: number[][] = cur.r.map(() => new Array(n).fill(0));
+      for (let j = 0; j < n; j++) {
+        const h = 1e-6 * Math.max(1, Math.abs(x[j]));
+        const xj = x[j];
+        x[j] = xj + h;
+        const rj = resid(x, withDrag, anchor).r;
+        x[j] = xj;
+        for (let k = 0; k < rj.length; k++) J[k][j] = (rj[k] - cur.r[k]) / h;
+      }
+      const A: number[][] = Array.from({ length: n }, () => new Array(n).fill(0));
+      const g = new Array(n).fill(0);
+      for (let k = 0; k < J.length; k++) {
+        const row = J[k];
+        const rk = cur.r[k];
+        for (let a = 0; a < n; a++) {
+          if (!row[a]) continue;
+          g[a] += row[a] * rk;
+          for (let b = a; b < n; b++) A[a][b] += row[a] * row[b];
+        }
+      }
+      for (let a = 0; a < n; a++) for (let b = 0; b < a; b++) A[a][b] = A[b][a];
+      let improved = false;
+      for (let tries = 0; tries < 8 && !improved; tries++) {
+        const M = A.map((row, a) => row.map((v, b) => (a === b ? v * (1 + lambda) + lambda : v)));
+        const step = linsolve(M, g.map((v) => -v));
+        if (!step) {
+          lambda *= 10;
+          continue;
+        }
+        const xn = x.map((v, j) => v + step[j]);
+        const nr = resid(xn, withDrag, anchor);
+        const nc = nr.r.reduce((s, v) => s + v * v, 0);
+        if (nc < cost) {
+          x = xn;
+          cur = nr;
+          cost = nc;
+          lambda = Math.max(1e-9, lambda / 3);
+          improved = true;
+        } else lambda *= 4;
+      }
+      if (!improved) break;
+    }
+  }
+  const ps = build(x);
+  for (const i of idx) profiles[i] = ps[i];
+  // Проверка: всё ли выполнено
+  const r: number[] = [];
+  for (const c of cons) residuals(ps, c, r);
+  for (const d of rds) r.push(Math.abs(sdist(handles(ps[d.i])[d.h], d.ref[0], d.ref[1])) - d.v!);
+  return r.every((v) => Math.abs(v) < 1e-3);
 }
 
 /** Связям, поворачивающим или сдвигающим стороны, нужен многоугольник вместо прямоугольника */
