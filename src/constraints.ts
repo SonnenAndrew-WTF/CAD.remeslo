@@ -537,3 +537,91 @@ export function prepareProfiles(profiles: Profile[], c: Constraint): Constraint[
   }
   return extra;
 }
+
+// ---------- определённость эскиза ----------
+
+/**
+ * Какие фигуры полностью определены связями и размерами (не имеют степеней свободы).
+ * Якобиан всех уравнений по всем параметрам приводится к ступенчатому виду; параметр
+ * определён, если ни одно допустимое движение (вектор ядра) его не меняет.
+ * Точка m дуги может скользить по самой дуге, не меняя её, — эту «пустую» свободу
+ * снимаем отдельным уравнением (m — посередине дуги).
+ */
+export function definedProfiles(profiles: Profile[], constraints: Constraint[], refDims: RefDimEq[] = []): boolean[] {
+  const cons = constraints.filter((c) => isValidRef(profiles, c.a) && isValidRef(profiles, c.b));
+  const rds = refDims.filter((r) => r.v !== undefined && profiles[r.i] && handles(profiles[r.i])[r.h]);
+  const offs: number[] = [];
+  const x0: number[] = [];
+  profiles.forEach((p) => {
+    offs.push(x0.length);
+    x0.push(...params(p));
+  });
+  const n = x0.length;
+  if (!n) return profiles.map(() => false);
+  const build = (x: number[]) => profiles.map((p, i) => withParams(p, x, offs[i]));
+  const resid = (x: number[]) => {
+    const ps = build(x);
+    const r: number[] = [];
+    for (const c of cons) residuals(ps, c, r);
+    for (const d of rds) r.push(Math.abs(sdist(handles(ps[d.i])[d.h], d.ref[0], d.ref[1])) - d.v!);
+    ps.forEach((p) => {
+      if (p.kind !== "arc") return;
+      const g = arcGeom(p);
+      if (!g) return;
+      const t = g.a0 + g.sw / 2;
+      let d = Math.atan2(p.m[1] - g.c[1], p.m[0] - g.c[0]) - t;
+      while (d > Math.PI) d -= 2 * Math.PI;
+      while (d < -Math.PI) d += 2 * Math.PI;
+      r.push(d * g.r);
+    });
+    return r;
+  };
+  const r0 = resid(x0);
+  const m = r0.length;
+  if (!m) return profiles.map(() => false);
+  // Якобиан (m × n) численно
+  const J: number[][] = r0.map(() => new Array(n).fill(0));
+  const x = x0.slice();
+  for (let j = 0; j < n; j++) {
+    const h = 1e-6 * Math.max(1, Math.abs(x[j]));
+    x[j] = x0[j] + h;
+    const rp = resid(x);
+    x[j] = x0[j] - h;
+    const rm = resid(x);
+    x[j] = x0[j];
+    for (let k = 0; k < m; k++) J[k][j] = (rp[k] - rm[k]) / (2 * h);
+  }
+  // Ступенчатый вид (Гаусс — Жордан)
+  const scale = Math.max(1e-12, ...J.flat().map(Math.abs));
+  const tol = 1e-7 * scale;
+  const pivots: number[] = [];
+  let row = 0;
+  for (let col = 0; col < n && row < m; col++) {
+    let piv = row;
+    for (let k = row + 1; k < m; k++) if (Math.abs(J[k][col]) > Math.abs(J[piv][col])) piv = k;
+    if (Math.abs(J[piv][col]) < tol) continue;
+    [J[row], J[piv]] = [J[piv], J[row]];
+    const div = J[row][col];
+    for (let j = col; j < n; j++) J[row][j] /= div;
+    for (let k = 0; k < m; k++) {
+      if (k === row || !J[k][col]) continue;
+      const f = J[k][col];
+      for (let j = col; j < n; j++) J[k][j] -= f * J[row][j];
+    }
+    pivots.push(col);
+    row++;
+  }
+  const isPivot = new Array(n).fill(false);
+  pivots.forEach((c) => (isPivot[c] = true));
+  const free = [...Array(n).keys()].filter((j) => !isPivot[j]);
+  const determined = new Array(n).fill(false);
+  pivots.forEach((c, rIdx) => {
+    determined[c] = free.every((f) => Math.abs(J[rIdx][f]) < 1e-6);
+  });
+  return profiles.map((p, i) => {
+    const k = params(p).length;
+    if (!k) return false;
+    for (let j = offs[i]; j < offs[i] + k; j++) if (!determined[j]) return false;
+    return true;
+  });
+}

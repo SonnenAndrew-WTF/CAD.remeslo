@@ -13,6 +13,7 @@ import {
   prepareProfiles,
   sameEnt,
   solve,
+  definedProfiles,
   type Constraint,
   type ConstraintKind,
   type EntRef,
@@ -1275,6 +1276,8 @@ function addPairDim(d: Draft, first: { ent: EntRef; k: number }, ent: EntRef) {
 
 /** Связи эскиза нельзя выполнить все сразу */
 let sketchConflict = false;
+/** Какие фигуры черновика полностью определены (кэш по состоянию эскиза) */
+let definedMemo: { key: string; defined: boolean[] } = { key: "", defined: [] };
 
 function drawDraft() {
   const d = draft;
@@ -1282,6 +1285,13 @@ function drawDraft() {
   // Связи восстанавливаются после любой правки; точка под пальцем остаётся на месте
   // Все связи и размеры решаются вместе; точка под пальцем следует за ним, насколько позволяют связи
   sketchConflict = !solve(d.profiles, d.constraints, d.drag ? { i: d.drag.i, h: d.drag.h } : null, d.refDims);
+  // Определённость пересчитываем, когда геометрия или связи изменились (не на каждое движение пальца)
+  if (!d.drag) {
+    const key = JSON.stringify([d.profiles, d.constraints, d.refDims]);
+    if (key !== definedMemo.key) definedMemo = { key, defined: d.constraints.length || d.refDims.length ? definedProfiles(d.profiles, d.constraints, d.refDims) : [] };
+  }
+  const defined = definedMemo.defined;
+  const allDefined = d.profiles.length > 0 && d.profiles.every((_, i) => defined[i]);
   const open: V2[][] = [];
   if (d.poly.length) open.push(d.cursor ? [...d.poly, d.cursor] : d.poly);
   if (d.stroke && d.stroke.length > 1) open.push(d.stroke);
@@ -1317,6 +1327,7 @@ function drawDraft() {
     selected: hl,
     refLines: d.tool === "dim" ? d.refLines : [],
     hover: d.hoverEnt ?? undefined,
+    defined,
   });
   // Перетаскиваемый профиль не должен прилипать сам к себе
   const snapFrom = d.profiles.filter((_, i) => i !== d.drag?.i);
@@ -1336,6 +1347,7 @@ function drawDraft() {
   const autoName: Record<string, string> = { horizontal: "горизонтально", vertical: "вертикально", parallel: "параллельно", perpendicular: "перпендикулярно" };
   if (sketchConflict) status("⚠ Связи или размеры противоречат друг другу — уберите лишнюю (последнюю — «Шаг назад»)");
   else if (d.tool === "dim" && d.dimFirst) status("Теперь коснитесь ребра тела или оси (зелёные линии)");
+  else if (allDefined && !pend && !d.poly.length && !d.start && !d.slotLine) status("✓ Эскиз полностью определён — у точек нет степеней свободы");
   else if (d.autoHint && d.poly.length && d.cursor)
     status(`Авто: ${autoName[d.autoHint.kind]} · отрезок ${fmt(dist2(d.poly[d.poly.length - 1], d.cursor))} мм`);
   else if (d.snapKind && d.cursor && !pend) status(`Привязка: ${d.snapKind} · X ${fmt(d.cursor[0])} Y ${fmt(d.cursor[1])}`);

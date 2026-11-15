@@ -9,6 +9,7 @@ import { LineMaterial } from "three/addons/lines/LineMaterial.js";
 import type { Body, RefPlane, Sketch } from "./doc";
 import { mesh, type Shape } from "./kernel";
 import { sketchRegions } from "./regions";
+import { definedProfiles } from "./constraints";
 import { closestOnSegment, dot, isClosed, outline, sub, toLocal, toWorld, type Profile, type SketchPlane, type V2, type Vec3 } from "./sketch";
 
 const TAP_MAX_MOVE = 10; // px
@@ -73,6 +74,8 @@ export interface DraftView {
   refLines?: [V2, V2][];
   /** Элемент под курсором/пером: точки и отрезки/кривые */
   hover?: { pts: V2[]; lines: V2[][] };
+  /** Фигуры, полностью определённые связями и размерами, — рисуются бордовым */
+  defined?: boolean[];
 }
 
 export type SketchEvent = "down" | "move" | "up" | "hover" | "cancel";
@@ -88,6 +91,8 @@ interface Palette {
   bg: number;
   grid: [number, number];
   sketchGrid: [number, number];
+  /** Линии полностью определённого эскиза */
+  defined: number;
   draft: number;
   sketchLine: number;
   dim: number;
@@ -95,8 +100,8 @@ interface Palette {
 }
 
 const PALETTES: Record<"dark" | "light", Palette> = {
-  dark: { bg: 0x1a1d23, grid: [0x4a505c, 0x2c3038], sketchGrid: [0x5a6170, 0x343943], draft: 0xffffff, sketchLine: 0x9fc0ff, dim: 0xc9d4e8, edges: 0x15171c },
-  light: { bg: 0xdde3ea, grid: [0x9aa4b2, 0xc4cbd5], sketchGrid: [0x8a94a3, 0xbac2cd], draft: 0x1d2330, sketchLine: 0x2f5fc0, dim: 0x3a4456, edges: 0x2a2f38 },
+  dark: { bg: 0x1a1d23, grid: [0x4a505c, 0x2c3038], sketchGrid: [0x5a6170, 0x343943], draft: 0xffffff, sketchLine: 0x9fc0ff, dim: 0xc9d4e8, edges: 0x15171c, defined: 0xc8415f },
+  light: { bg: 0xdde3ea, grid: [0x9aa4b2, 0xc4cbd5], sketchGrid: [0x8a94a3, 0xbac2cd], draft: 0x1d2330, sketchLine: 0x2f5fc0, dim: 0x3a4456, edges: 0x2a2f38, defined: 0x8e1b36 },
 };
 
 /** Грани кубика вида: нормаль, «верх» надписи и подпись */
@@ -1065,12 +1070,14 @@ export class Viewport {
 
   private buildSketch(sk: Sketch): THREE.Group {
     const g = new THREE.Group();
-    // Линии — все профили как нарисованы
-    sk.profiles.forEach((p) => {
+    // Линии — все профили как нарисованы; полностью определённые — бордовым
+    const defined = sk.constraints?.length || sk.refDims?.length ? definedProfiles(sk.profiles, sk.constraints ?? [], sk.refDims ?? []) : [];
+    sk.profiles.forEach((p, i) => {
       const pts = outline(p).map(([x, y]) => new THREE.Vector2(x, y));
+      const color = defined[i] ? this.palette.defined : this.palette.sketchLine;
       const ln = isClosed(p)
-        ? new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color: this.palette.sketchLine }))
-        : this.openLine(pts.map((q) => [q.x, q.y] as V2), this.palette.sketchLine, p.kind === "axis");
+        ? new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(pts), new THREE.LineBasicMaterial({ color }))
+        : this.openLine(pts.map((q) => [q.x, q.y] as V2), color, p.kind === "axis");
       ln.matrixAutoUpdate = false;
       ln.matrix.copy(planeMatrix(sk.plane, 0.06));
       g.add(ln);
@@ -1335,13 +1342,14 @@ export class Viewport {
     };
     const toV = (pts: V2[]) => pts.map(([x, y]) => new THREE.Vector3(x, y, 0));
     // Всё в черновике рисуется без проверки глубины — эскиз виден и внутри тела
-    for (const p of v.closed) {
+    v.closed.forEach((p, i) => {
       const pts = outline(p);
+      const color = v.defined?.[i] ? this.palette.defined : this.palette.draft;
       if (!isClosed(p)) {
-        add(this.openLine(pts, this.palette.draft, p.kind === "axis", true));
-        continue;
+        add(this.openLine(pts, color, p.kind === "axis", true));
+        return;
       }
-      const loop = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(toV(pts)), new THREE.LineBasicMaterial({ color: this.palette.draft, depthTest: false }));
+      const loop = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(toV(pts)), new THREE.LineBasicMaterial({ color, depthTest: false }));
       loop.renderOrder = 2;
       add(loop);
       const fill = new THREE.Mesh(
@@ -1350,7 +1358,7 @@ export class Viewport {
       );
       fill.renderOrder = 1;
       add(fill);
-    }
+    });
     for (const pts of v.open) {
       if (pts.length < 2) continue;
       const ln = new THREE.Line(new THREE.BufferGeometry().setFromPoints(toV(pts)), new THREE.LineBasicMaterial({ color: 0xffb02e, depthTest: false }));
