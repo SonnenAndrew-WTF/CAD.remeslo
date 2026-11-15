@@ -18,6 +18,7 @@ import {
 } from "./constraints";
 import { sketchRegions } from "./regions";
 import { recognize } from "./recognize";
+import { trimAt } from "./trim";
 import { Viewport, type Dim, type Pick, type PickMode, type ProfileRef, type SubSelection } from "./viewport";
 import * as K from "./kernel";
 import type { Primitive } from "./kernel";
@@ -30,6 +31,7 @@ import { deserialize, serialize } from "./project";
 import {
   STD_PLANES,
   PROFILE_NAMES,
+  arcGeom,
   anglePlane,
   offsetPlane,
   plane3,
@@ -618,7 +620,7 @@ function exportFile(fmt: "stl" | "step") {
 }
 
 // ---------- эскиз ----------
-type Tool = "select" | "line" | "free" | "rect" | "crect" | "circle" | "ellipse" | "slot" | "axis" | "dim" | "constraint";
+type Tool = "select" | "line" | "free" | "arc" | "trim" | "rect" | "crect" | "circle" | "ellipse" | "slot" | "axis" | "dim" | "constraint";
 /** Авто-связь отрезка ломаной, которая ещё рисуется (i = -1 — эта же ломаная) */
 interface PendCon {
   kind: ConstraintKind;
@@ -684,6 +686,8 @@ const TOOLS: { id: Tool; ico: string; label: string; hint: string }[] = [
   { id: "circle", ico: "◯", label: "Круг", hint: "Проведите от центра до края (или два касания)." },
   { id: "ellipse", ico: "⬭", label: "Эллипс", hint: "Проведите от центра до угла описанного прямоугольника." },
   { id: "slot", ico: "⊂⊃", label: "Паз", hint: "Проведите осевую линию паза, затем отведите палец, задавая ширину, и коснитесь." },
+  { id: "trim", ico: "✂", label: "Обрезка", hint: "Коснитесь участка линии, окружности или дуги — он удалится до ближайших пересечений (без пересечений — целиком)." },
+  { id: "arc", ico: "◠", label: "Дуга", hint: "Проведите от начала до конца дуги (или два касания), затем отведите палец, задавая изгиб, и коснитесь." },
   { id: "axis", ico: "┆", label: "Ось", hint: "Проведите ось (или два касания). Ось нужна для тел вращения и массивов по кругу." },
   { id: "constraint", ico: "∥", label: "Связи", hint: "Выберите тип связи и коснитесь элементов эскиза. Начало координат и оси X/Y тоже можно выбрать — они неподвижны." },
   { id: "dim", ico: "↔", label: "Размер", hint: "Коснитесь отрезка или окружности — нанесётся размер (длина или диаметр), он держит значение как связь. Точка, затем ребро тела или ось (зелёные линии) — размер до ребра. Касание числа — изменить, пустое поле — удалить." },
@@ -938,11 +942,13 @@ const isValid = (p: Profile) =>
   : p.kind === "ellipse" ? p.rx > 0 && p.ry > 0
   : p.kind === "slot" ? p.r > 0 && dist2(p.a, p.b) > 0
   : p.kind === "axis" ? dist2(p.a, p.b) > 0
+  : p.kind === "arc" ? dist2(p.a, p.b) > 0 && !!arcGeom(p)
   : true;
 
 /** Профиль, который сейчас «тянется» пальцем (для предпросмотра и размеров) */
 function pendingProfile(d: Draft): Profile | null {
   if (!d.cursor) return null;
+  if (d.tool === "arc" && d.slotLine) return { kind: "arc", a: d.slotLine[0], b: d.slotLine[1], m: d.cursor };
   if (d.tool === "slot" && d.slotLine) {
     const [a, b] = d.slotLine;
     return { kind: "slot", a, b, r: dist2(d.cursor, footOnLine(d.cursor, a, b)) };
@@ -1047,6 +1053,10 @@ function sketchDims(d: Draft): Dim[] {
       const side = P.kind === "rect" || (P.kind === "poly" && signedArea(P.pts) > 0) ? -1 : 1;
       dims.push({ id: `con:${k}`, kind: "linear", a, b, side, text: fmt(c.v ?? dist2(a, b)), editable: true });
     } else if (P.kind === "circle") dims.push({ id: `con:${k}`, kind: "diameter", c: [P.cx, P.cy], r: P.r, text: `Ø ${fmt(c.v ?? P.r * 2)}`, editable: true });
+    else if (P.kind === "arc") {
+      const g = arcGeom(P);
+      if (g) dims.push({ id: `con:${k}`, kind: "diameter", c: g.c, r: g.r, text: `Ø ${fmt(c.v ?? g.r * 2)}`, editable: true });
+    }
   });
   const pend = pendingProfile(d);
   if (pend) add(pend, "pending", false);
@@ -1205,7 +1215,8 @@ function addDim(d: Draft, ent: EntRef) {
   const kind: ConstraintKind = ent.t === "line" ? "length" : "diameter";
   if (d.constraints.some((c) => c.kind === kind && sameEnt(c.a, ent))) return toast("Размер уже нанесён — коснитесь числа, чтобы изменить");
   const P = d.profiles[ent.i];
-  const v = ent.t === "line" ? dist2(...lineOf(d.profiles, ent)) : P.kind === "circle" ? P.r * 2 : 0;
+  const ag = P.kind === "arc" ? arcGeom(P) : null;
+  const v = ent.t === "line" ? dist2(...lineOf(d.profiles, ent)) : P.kind === "circle" ? P.r * 2 : ag ? ag.r * 2 : 0;
   if (!(v > 0)) return;
   keepStep(d);
   d.constraints.push({ kind, a: ent, b: ent, v: +v.toFixed(4) });
@@ -1225,11 +1236,11 @@ function drawDraft() {
   const open: V2[][] = [];
   if (d.poly.length) open.push(d.cursor ? [...d.poly, d.cursor] : d.poly);
   if (d.stroke && d.stroke.length > 1) open.push(d.stroke);
-  if (d.tool === "slot" && d.start && d.cursor && !d.slotLine) open.push([d.start, d.cursor]);
+  if ((d.tool === "slot" || d.tool === "arc") && d.start && d.cursor && !d.slotLine) open.push([d.start, d.cursor]);
   const pend = pendingProfile(d);
   if (pend) {
     const pts = outline(pend);
-    open.push([...pts, pts[0]]);
+    open.push(isClosed(pend) ? [...pts, pts[0]] : pts);
   }
   const showHandles = d.tool === "select" || d.tool === "dim" || d.tool === "constraint";
   const hl = [d.sel, d.dimFirst].filter(Boolean).map((r) => handles(d.profiles[r!.i])[r!.h]);
@@ -1264,6 +1275,8 @@ function drawDraft() {
   const typed = snapFrom.flatMap(snapPointsTyped);
   const curves = snapFrom.flatMap((q) => (q.kind === "circle" || q.kind === "ellipse" || q.kind === "slot" ? [outline(q)] : []));
   const curveSegs = curves.flatMap((o) => o.map((a, i) => [a, o[(i + 1) % o.length]] as [V2, V2]));
+  // Дуги — без замыкающей хорды
+  for (const q of snapFrom) if (q.kind === "arc") outline(q).forEach((a, i, o) => i + 1 < o.length && curveSegs.push([a, o[i + 1]]));
   view.setSnapTargets(
     [[0, 0], ...typed.map((t) => t.p), ...d.poly, ...d.bodySnaps.points],
     ["начало координат", ...typed.map((t) => SNAP_NAMES[t.k]), ...d.poly.map(() => "точка линии"), ...d.bodySnaps.kinds],
@@ -1280,7 +1293,10 @@ function drawDraft() {
   else if (pend?.kind === "rect") status(`Прямоугольник ${fmt(pend.w)} × ${fmt(pend.h)} мм`);
   else if (pend?.kind === "circle") status(`Окружность R ${fmt(pend.r)} мм (Ø ${fmt(pend.r * 2)})`);
   else if (pend?.kind === "ellipse") status(`Эллипс ${fmt(pend.rx * 2)} × ${fmt(pend.ry * 2)} мм`);
-  else if (pend?.kind === "slot") status(`Паз: длина ${fmt(dist2(pend.a, pend.b))}, ширина ${fmt(pend.r * 2)} мм`);
+  else if (pend?.kind === "arc") {
+    const g = arcGeom(pend);
+    status(g ? `Дуга R ${fmt(g.r)} мм, ${fmt((Math.abs(g.sw) * 180) / Math.PI)}°` : "Дуга: отведите палец в сторону");
+  } else if (pend?.kind === "slot") status(`Паз: длина ${fmt(dist2(pend.a, pend.b))}, ширина ${fmt(pend.r * 2)} мм`);
   else if (d.poly.length && d.cursor) status(`Отрезок ${fmt(dist2(d.poly[d.poly.length - 1], d.cursor))} мм`);
   else if (d.cursor) status(`X ${fmt(d.cursor[0])}  Y ${fmt(d.cursor[1])}`);
 }
@@ -1293,9 +1309,9 @@ function entityUnder(d: Draft, raw: V2): { pts: V2[]; lines: V2[][] } | null {
   let best: V2[] | null = null;
   let bestD = tol;
   for (const p of d.profiles) {
-    if (p.kind === "circle" || p.kind === "ellipse" || p.kind === "slot") {
+    if (p.kind === "circle" || p.kind === "ellipse" || p.kind === "slot" || p.kind === "arc") {
       const o = outline(p);
-      const loop = [...o, o[0]];
+      const loop = p.kind === "arc" ? o : [...o, o[0]];
       for (let i = 0; i + 1 < loop.length; i++) {
         const dd = dist2(raw, closestOnSegment(raw, loop[i], loop[i + 1]));
         if (dd < bestD) [best, bestD] = [loop, dd];
@@ -1312,7 +1328,7 @@ function entityUnder(d: Draft, raw: V2): { pts: V2[]; lines: V2[][] } | null {
 
 /** Ортогональный режим: от предыдущей точки — строго по горизонтали или вертикали */
 function orthoSnap(d: Draft, p: V2): V2 {
-  const anchor = d.tool === "line" ? d.poly[d.poly.length - 1] : (d.tool === "axis" || d.tool === "slot") && !d.slotLine ? d.start : null;
+  const anchor = d.tool === "line" ? d.poly[d.poly.length - 1] : (d.tool === "axis" || d.tool === "slot" || d.tool === "arc") && !d.slotLine ? d.start : null;
   if (!d.ortho || !anchor) return p;
   return Math.abs(p[0] - anchor[0]) >= Math.abs(p[1] - anchor[1]) ? [p[0], anchor[1]] : [anchor[0], p[1]];
 }
@@ -1375,6 +1391,8 @@ view.onSketch = (type, p0, hot, raw, snap) => {
         toast(`✍ ${rec.name}`);
       } else toast("Не распознал фигуру — нарисуйте крупнее одним движением");
     }
+  } else if (d.tool === "trim") {
+    if (type === "up") trimTap(d, raw);
   } else if (d.tool === "constraint") {
     if (type === "up") addConstraintTap(d, raw);
   } else if (d.tool === "dim") {
@@ -1410,8 +1428,8 @@ view.onSketch = (type, p0, hot, raw, snap) => {
         d.poly.push(p);
       }
     }
-  } else if (d.tool === "slot" && d.slotLine) {
-    // Третий шаг паза: касание фиксирует ширину
+  } else if ((d.tool === "slot" || d.tool === "arc") && d.slotLine) {
+    // Третий шаг паза/дуги: касание фиксирует ширину или изгиб
     if (type === "up") {
       const prof = pendingProfile(d)!;
       if (isValid(prof)) commitProfile(prof);
@@ -1423,10 +1441,10 @@ view.onSketch = (type, p0, hot, raw, snap) => {
   } else if (type === "up" && d.start) {
     // Касание без движения поставило только первую точку — ждём второе касание
     if (!(d.pressStarted && dist2(p, d.start) < 1e-9)) {
-      if (d.tool === "slot") {
+      if (d.tool === "slot" || d.tool === "arc") {
         if (dist2(d.start, p) > 1e-9) {
           d.slotLine = [d.start, p];
-          status("Отведите палец, задавая ширину паза, и коснитесь");
+          status(d.tool === "arc" ? "Отведите палец, задавая изгиб дуги, и коснитесь" : "Отведите палец, задавая ширину паза, и коснитесь");
         }
       } else {
         const prof = pendingProfile(d);
@@ -1440,6 +1458,21 @@ view.onSketch = (type, p0, hot, raw, snap) => {
   // Решатель мог сдвинуть фигуры — числа в панели должны совпадать с картинкой
   if (type === "up") renderProps();
 };
+
+/** Касание в инструменте «Обрезка» */
+function trimTap(d: Draft, raw: V2) {
+  const res = trimAt(d.profiles, raw, 16 / view.pxPerUnit());
+  if (!res) return toast("Коснитесь линии, окружности или дуги");
+  keepStep(d);
+  // Номера точек фигуры меняются — её связи и размеры снимаются; остатки — новые фигуры
+  removeProfileAt(res.index);
+  for (const part of res.parts) {
+    d.profiles.push(part);
+    autoAttach(d, d.profiles.length - 1);
+  }
+  haptic("tick");
+  renderProps();
+}
 
 /** Касание в инструменте «Связи»: первый элемент, затем второй — связь создаётся */
 function addConstraintTap(d: Draft, raw: V2) {
@@ -2412,6 +2445,10 @@ function profileFields(p: Profile, update: (p: Profile) => void): HTMLElement[] 
       ];
     case "region":
       return [];
+    case "arc": {
+      const g = arcGeom(p);
+      return g ? [el("div", { className: "hint", textContent: `R ${fmt(g.r)} мм, угол ${fmt((Math.abs(g.sw) * 180) / Math.PI)}°` })] : [];
+    }
     case "poly":
       return [el("div", { className: "hint", textContent: `${p.pts.length} точек` }), cornerField(p)];
     case "path":

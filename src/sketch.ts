@@ -35,6 +35,8 @@ export type Profile =
   | { kind: "path"; pts: V2[] }
   /** Ось — вспомогательная линия для тел вращения и массивов */
   | { kind: "axis"; a: V2; b: V2 }
+  /** Дуга окружности от a до b через точку m (открытая, как линия) */
+  | { kind: "arc"; a: V2; b: V2; m: V2 }
   /**
    * Авто-область (одна или несколько соседних) — не хранится в эскизе, а вычисляется
    * из пересечений; pts — внешние границы ломаной для проверок и центра
@@ -42,7 +44,38 @@ export type Profile =
   | { kind: "region"; parts: RegionPart[]; pts: V2[] };
 
 /** Замкнутый ли контур (можно вытянуть или повернуть) */
-export const isClosed = (p: Profile) => p.kind !== "path" && p.kind !== "axis";
+export const isClosed = (p: Profile) => p.kind !== "path" && p.kind !== "axis" && p.kind !== "arc";
+
+/**
+ * Окружность дуги по трём точкам: центр, радиус, начальный угол и поворот со знаком
+ * (от a через m к b). null — точки на одной прямой (дуга вырождена в отрезок)
+ */
+export function arcGeom(p: { a: V2; b: V2; m: V2 }): { c: V2; r: number; a0: number; sw: number } | null {
+  const [ax, ay] = p.a;
+  const [bx, by] = p.m;
+  const [cx, cy] = p.b;
+  const d = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+  if (Math.abs(d) < 1e-9) return null;
+  const a2 = ax * ax + ay * ay;
+  const b2 = bx * bx + by * by;
+  const c2 = cx * cx + cy * cy;
+  const c: V2 = [(a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d, (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d];
+  const r = Math.hypot(ax - c[0], ay - c[1]);
+  const ang = (q: V2) => Math.atan2(q[1] - c[1], q[0] - c[0]);
+  const a0 = ang(p.a);
+  const norm = (x: number) => ((x % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+  // Обход против часовой, если m встречается раньше b; иначе по часовой
+  const toM = norm(ang(p.m) - a0);
+  const toB = norm(ang(p.b) - a0);
+  const sw = toM < toB ? toB : toB - 2 * Math.PI;
+  return { c, r, a0, sw };
+}
+
+/** Точка дуги посередине — после правки концов m снова в середине */
+export function arcMid(c: V2, r: number, a0: number, sw: number): V2 {
+  const t = a0 + sw / 2;
+  return [c[0] + r * Math.cos(t), c[1] + r * Math.sin(t)];
+}
 
 /** Размер от точки эскиза (профиль i, ручка h) до опорной линии ref (ребро тела или ось) */
 export interface RefDim {
@@ -216,6 +249,12 @@ export function outline(p: Profile): V2[] {
       return p.pts;
     case "axis":
       return [p.a, p.b];
+    case "arc": {
+      const g = arcGeom(p);
+      if (!g) return [p.a, p.b];
+      const n = Math.max(8, Math.ceil((Math.abs(g.sw) / (2 * Math.PI)) * 96));
+      return arc(g.c, g.r, g.a0, g.a0 + g.sw, n);
+    }
     case "region":
       return p.pts;
   }
@@ -231,6 +270,8 @@ export function centroid(p: Profile): V2 {
     case "slot":
     case "axis":
       return v2.mul(v2.add(p.a, p.b), 0.5);
+    case "arc":
+      return p.m;
     case "poly":
     case "path":
     case "region": {
@@ -256,6 +297,8 @@ export function handles(p: Profile): V2[] {
     case "poly":
     case "path":
       return p.pts;
+    case "arc":
+      return [p.a, p.b, p.m];
     case "region":
       return [];
   }
@@ -277,6 +320,8 @@ export function translateProfile(p: Profile, dx: number, dy: number): Profile {
     case "poly":
     case "path":
       return { ...p, pts: p.pts.map(t) };
+    case "arc":
+      return { ...p, a: t(p.a), b: t(p.b), m: t(p.m) };
     case "region":
       return p;
   }
@@ -303,6 +348,8 @@ export function moveHandle(p: Profile, h: number, q: V2): Profile {
     case "poly":
     case "path":
       return { ...p, pts: p.pts.map((x, i) => (i === h ? q : x)) };
+    case "arc":
+      return h === 0 ? { ...p, a: q } : h === 1 ? { ...p, b: q } : { ...p, m: q };
     case "region":
       return p;
   }
@@ -349,6 +396,10 @@ export function snapPointsTyped(p: Profile): { p: V2; k: SnapKind }[] {
       ...([[rx, 0], [-rx, 0], [0, ry], [0, -ry]] as V2[]).map(([dx, dy]) => ({ p: [p.cx + dx, p.cy + dy] as V2, k: "quad" as const })),
     ];
   }
+  if (p.kind === "arc") {
+    const g = arcGeom(p);
+    return [{ p: p.a, k: "end" }, { p: p.b, k: "end" }, { p: p.m, k: "mid" }, ...(g ? [{ p: g.c, k: "center" as const }] : [])];
+  }
   const ends = handles(p).map((q, i) => ({ p: q, k: (p.kind === "rect" && i === 4 ? "center" : "end") as SnapKind }));
   const mids = p.kind === "slot" ? [] : segments(p).map(([a, b]) => ({ p: v2.mul(v2.add(a, b), 0.5), k: "mid" as const }));
   return [...ends, ...mids];
@@ -373,4 +424,4 @@ export function rectFromCenter(c: V2, q: V2): Profile {
 
 export const fmt = (v: number) => String(+v.toFixed(2));
 
-export const PROFILE_NAMES = { rect: "Прямоугольник", circle: "Окружность", ellipse: "Эллипс", slot: "Паз", poly: "Многоугольник", path: "Линии", axis: "Ось", region: "Область" };
+export const PROFILE_NAMES = { rect: "Прямоугольник", circle: "Окружность", ellipse: "Эллипс", slot: "Паз", poly: "Многоугольник", path: "Линии", axis: "Ось", arc: "Дуга", region: "Область" };

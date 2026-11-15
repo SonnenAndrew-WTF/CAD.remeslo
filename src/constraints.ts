@@ -1,6 +1,6 @@
 // Геометрические связи эскиза и численный решатель (все связи одновременно).
 // Размеры (длина, диаметр) — тоже связи: перетаскивание точек их не меняет.
-import { closestOnSegment, dist2, handles, segments, type Profile, type V2 } from "./sketch";
+import { arcGeom, closestOnSegment, dist2, handles, segments, type Profile, type V2 } from "./sketch";
 
 export type EntKind = "pt" | "line" | "circle";
 /** Элемент эскиза: профиль i, номер элемента e (точка-ручка, сторона или окружность) */
@@ -27,6 +27,7 @@ export type ConstraintKind =
   | "horizontal"
   | "vertical"
   | "equal"
+  | "concentric"
   | "fix"
   | "length"
   | "diameter";
@@ -65,6 +66,7 @@ export const CONSTRAINTS: ConstraintDef[] = [
   { kind: "horizontal", label: "Горизонтально", glyph: "Г", hint: "Коснитесь отрезка — он станет горизонтальным", first: ["line"], second: [] },
   { kind: "vertical", label: "Вертикально", glyph: "В", hint: "Коснитесь отрезка — он станет вертикальным", first: ["line"], second: [] },
   { kind: "equal", label: "Равенство", glyph: "=", hint: "Коснитесь двух отрезков (длины) или двух окружностей (радиусы) — второй станет равен первому", first: ["line", "circle"], second: ["line", "circle"] },
+  { kind: "concentric", label: "Концентрично", glyph: "◎", hint: "Коснитесь двух окружностей или дуг — центр второй совпадёт с центром первой", first: ["circle"], second: ["circle"] },
   { kind: "fix", label: "Закрепить", glyph: "⚓", hint: "Коснитесь точки — она останется на месте при любых правках", first: ["pt"], second: [] },
   { kind: "length", label: "Длина", glyph: "↔", hint: "", first: ["line"], second: [], dim: true },
   { kind: "diameter", label: "Диаметр", glyph: "Ø", hint: "", first: ["circle"], second: [], dim: true },
@@ -87,8 +89,14 @@ export function lines(p: Profile): [V2, V2][] {
   return p.kind === "slot" ? [] : segments(p);
 }
 
+/** Окружность элемента: круг или окружность, на которой лежит дуга */
 function circleOf(p: Profile): { c: V2; r: number } | null {
-  return p.kind === "circle" ? { c: [p.cx, p.cy], r: p.r } : null;
+  if (p.kind === "circle") return { c: [p.cx, p.cy], r: p.r };
+  if (p.kind === "arc") {
+    const g = arcGeom(p);
+    return g && { c: g.c, r: g.r };
+  }
+  return null;
 }
 
 /** Геометрия элемента (начало координат — тоже элемент) */
@@ -167,7 +175,7 @@ export function isValidRef(profiles: Profile[], r: EntRef): boolean {
   if (!p) return false;
   if (r.t === "pt") return r.e < handles(p).length;
   if (r.t === "line") return r.e < lines(p).length;
-  return p.kind === "circle";
+  return p.kind === "circle" || p.kind === "arc";
 }
 
 // ---------- решатель ----------
@@ -201,6 +209,8 @@ function params(p: Profile): number[] {
       return [...p.a, ...p.b, p.r];
     case "axis":
       return [...p.a, ...p.b];
+    case "arc":
+      return [...p.a, ...p.b, ...p.m];
     case "poly":
     case "path":
       return p.pts.flat();
@@ -221,6 +231,8 @@ function withParams(p: Profile, v: number[], o: number): Profile {
       return { ...p, a: [v[o], v[o + 1]], b: [v[o + 2], v[o + 3]], r: v[o + 4] };
     case "axis":
       return { ...p, a: [v[o], v[o + 1]], b: [v[o + 2], v[o + 3]] };
+    case "arc":
+      return { ...p, a: [v[o], v[o + 1]], b: [v[o + 2], v[o + 3]], m: [v[o + 4], v[o + 5]] };
     case "poly":
     case "path":
       return { ...p, pts: p.pts.map((_, k) => [v[o + 2 * k], v[o + 2 * k + 1]] as V2) };
@@ -283,6 +295,12 @@ function residuals(ps: Profile[], c: Constraint, out: number[]) {
         const cb = circOf(ps, c.b);
         if (ca && cb) out.push(ca.r - cb.r);
       } else out.push(dist2(...lineOf(ps, c.a)) - dist2(...lineOf(ps, c.b)));
+      break;
+    }
+    case "concentric": {
+      const ca = circOf(ps, c.a);
+      const cb = circOf(ps, c.b);
+      if (ca && cb) out.push(ca.c[0] - cb.c[0], ca.c[1] - cb.c[1]);
       break;
     }
     case "length":
@@ -371,6 +389,7 @@ export function solve(profiles: Profile[], constraints: Constraint[], fixed: Fix
   const dragTarget = fixed && used.has(fixed.i) ? handles(profiles[fixed.i])[fixed.h] : null;
 
   /** Все невязки: связи, размеры до граней, палец, «остаться на месте» */
+  let wReg = W_REG;
   const resid = (x: number[], withDrag: boolean, anchor: number[]) => {
     const ps = build(x);
     const r: number[] = [];
@@ -382,13 +401,21 @@ export function solve(profiles: Profile[], constraints: Constraint[], fixed: Fix
       const q = handles(ps[fixed!.i])[fixed!.h];
       r.push(W_DRAG * (q[0] - dragTarget[0]), W_DRAG * (q[1] - dragTarget[1]));
     }
-    for (let j = 0; j < n; j++) r.push(W_REG * (x[j] - anchor[j]));
+    for (let j = 0; j < n; j++) r.push(wReg * (x[j] - anchor[j]));
     return { r, m };
   };
 
   let x = x0.slice();
   // Сначала с пальцем, потом без него — чтобы связи выполнились точно
-  for (const withDrag of dragTarget ? [true, false] : [false]) {
+  // Фазы: с пальцем, без пальца и (если связи ещё не точны) с почти отпущенным «остаться на месте»
+  for (const phase of dragTarget ? ["drag", "free", "polish"] : ["free", "polish"]) {
+    const withDrag = phase === "drag";
+    if (phase === "polish") {
+      const q = resid(x, false, x);
+      const rr = q.r.slice(0, q.m);
+      if (Math.max(0, ...rr.map(Math.abs)) < 1e-6 * W_CON) break;
+      wReg = W_REG * 1e-3;
+    }
     const anchor = x.slice();
     let lambda = 1e-3;
     let cur = resid(x, withDrag, anchor);

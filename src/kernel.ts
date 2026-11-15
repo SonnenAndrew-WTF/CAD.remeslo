@@ -291,6 +291,7 @@ function profileDrawing(p: Profile): Drawing {
       return regionDrawing(p);
     case "path":
     case "axis":
+    case "arc":
       throw new Error("Контур не замкнут — его нельзя вытянуть или повернуть");
   }
 }

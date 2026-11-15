@@ -498,6 +498,9 @@ button.primary:active { box-shadow: inset 3px 3px 7px rgba(0,0,0,.3); }
   background: var(--bg);
   box-shadow: var(--raised);
 }
+.numpad .np-grip { height: 22px; margin: -6px -4px 4px; cursor: grab; touch-action: none; position: relative; }
+.numpad .np-grip::after { content: ""; position: absolute; left: 50%; top: 9px; width: 44px; height: 5px; margin-left: -22px; border-radius: 3px; background: var(--muted); opacity: .55; }
+.numpad .np-preview { cursor: grab; touch-action: none; }
 .numpad .np-preview { min-height: 20px; margin: 0 4px 6px; text-align: right; color: var(--accent); font-weight: 600; font-size: 14px; }
 .np-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
 .np-grid button { height: 50px; font-size: 19px; transition: transform .12s ease, box-shadow .12s ease, background-color .12s ease; }

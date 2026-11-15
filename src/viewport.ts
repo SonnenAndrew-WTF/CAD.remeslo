@@ -659,7 +659,8 @@ export class Viewport {
         if (multiTouch) return;
         const draws = !(e.pointerType === "touch" && this.sawPen);
         if (downs.has(e.pointerId) && draws) this.emitSketch("move", e);
-        else if (e.pointerType !== "touch") this.emitSketch("hover", e);
+        // Наведение — только мышью: перо над экраном не рисует маркер, пока не коснётся
+        else if (e.pointerType === "mouse") this.emitSketch("hover", e);
         return;
       }
       if (box && downs.has(e.pointerId) && !multiTouch && !this.gizmoBusy) {

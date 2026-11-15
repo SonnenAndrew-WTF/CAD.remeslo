@@ -80,6 +80,11 @@ const KEYS: (string | [string, string])[] = [
 let pad: HTMLDivElement | null = null;
 let target: HTMLInputElement | null = null;
 let original = "";
+/** Значение ещё не трогали: первая цифра заменяет его целиком (как выделенный текст) */
+let fresh = false;
+/** Куда пользователь перетащил клавиатуру — в следующий раз она откроется там же */
+let padPos: { left: number; top: number } | null = null;
+const OPERATORS = ["+", "−", "×", "÷"];
 
 function closePad() {
   pad?.remove();
@@ -98,6 +103,9 @@ function preview() {
 function press(key: string) {
   const t = target;
   if (!t) return;
+  // Первое нажатие цифры заменяет старое значение; оператор продолжает его (40 → 40+5)
+  if (fresh && key !== "ok" && key !== "cancel" && key !== "neg" && key !== "back" && !OPERATORS.includes(key)) t.value = "";
+  if (key !== "ok" && key !== "cancel") fresh = false;
   if (key === "back") t.value = t.value.slice(0, -1);
   else if (key === "neg") t.value = t.value.startsWith("-") ? t.value.slice(1) : "-" + t.value;
   else if (key === "clear") t.value = "";
@@ -131,9 +139,10 @@ function openPad(input: HTMLInputElement) {
   closePad();
   target = input;
   original = input.value;
+  fresh = true;
   pad = document.createElement("div");
   pad.className = "numpad";
-  pad.innerHTML = `<div class="np-preview"> </div>`;
+  pad.innerHTML = `<div class="np-grip" title="Перетащите клавиатуру"></div><div class="np-preview"> </div>`;
   const grid = document.createElement("div");
   grid.className = "np-grid";
   const all: [string, string, string?][] = [
@@ -164,8 +173,37 @@ function openPad(input: HTMLInputElement) {
   const r = input.getBoundingClientRect();
   const w = pad.offsetWidth;
   const h = pad.offsetHeight;
-  pad.style.left = `${Math.max(8, Math.min(r.right - w, innerWidth - w - 8))}px`;
-  pad.style.top = `${r.bottom + h + 8 < innerHeight ? r.bottom + 6 : Math.max(8, r.top - h - 6)}px`;
+  const clampX = (x: number) => Math.max(8, Math.min(x, innerWidth - w - 8));
+  const clampY = (y: number) => Math.max(8, Math.min(y, innerHeight - h - 8));
+  if (padPos) {
+    pad.style.left = `${clampX(padPos.left)}px`;
+    pad.style.top = `${clampY(padPos.top)}px`;
+  } else {
+    pad.style.left = `${clampX(r.right - w)}px`;
+    pad.style.top = `${r.bottom + h + 8 < innerHeight ? r.bottom + 6 : Math.max(8, r.top - h - 6)}px`;
+  }
+  // Перетаскивание за полоску сверху или за строку результата — если клавиатура закрывает размер
+  const box = pad;
+  const drag = (e: PointerEvent) => {
+    e.preventDefault(); // поле не теряет фокус
+    const sx = e.clientX - box.offsetLeft;
+    const sy = e.clientY - box.offsetTop;
+    const move = (m: PointerEvent) => {
+      padPos = { left: clampX(m.clientX - sx), top: clampY(m.clientY - sy) };
+      box.style.left = `${padPos.left}px`;
+      box.style.top = `${padPos.top}px`;
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+  };
+  pad.querySelector<HTMLElement>(".np-grip")!.addEventListener("pointerdown", drag);
+  pad.querySelector<HTMLElement>(".np-preview")!.addEventListener("pointerdown", drag);
   input.select();
   preview();
 }

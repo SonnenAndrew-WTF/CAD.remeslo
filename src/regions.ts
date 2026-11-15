@@ -3,7 +3,7 @@
 // Кривые (отрезки, дуги, эллипсы) для поиска пересечений дробятся на короткие хорды,
 // но точки пересечения уточняются по точной геометрии, а граница области собирается
 // снова из точных отрезков и дуг — ядро строит тело без граней-«ступенек».
-import { dist2, rectCorners, type Profile, type RSeg, type V2 } from "./sketch";
+import { arcGeom, dist2, rectCorners, type Profile, type RSeg, type V2 } from "./sketch";
 
 type Curve =
   | { k: "line"; a: V2; b: V2 }
@@ -104,6 +104,10 @@ function profileCurves(p: Profile): Curve[] {
     }
     case "path":
       return p.pts.slice(0, -1).map((a, j) => ({ k: "line", a, b: p.pts[j + 1] }) as Curve);
+    case "arc": {
+      const g = arcGeom(p);
+      return g ? [{ k: "arc", c: g.c, r: g.r, a0: g.a0, sw: g.sw }] : [{ k: "line", a: p.a, b: p.b }];
+    }
     default:
       return [];
   }
