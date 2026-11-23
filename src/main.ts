@@ -2576,19 +2576,23 @@ function renderConstraintSection(root: HTMLElement, d: Draft) {
   const grid = el("div", { className: "con-grid" });
   for (const c of CONSTRAINTS.filter((x) => !x.dim)) {
     const b = el("button", { className: d.conKind === c.kind ? "on" : "", title: c.hint }, el("span", { className: "ico", textContent: c.glyph }), c.label);
+    if (d.tool !== "constraint") b.classList.remove("on");
     b.addEventListener("click", () => {
       d.conKind = c.kind;
       d.conFirst = null;
+      // Выбор типа связи сразу включает инструмент «Связи»
+      if (d.tool !== "constraint") setTool("constraint");
       renderProps();
       drawDraft();
     });
     grid.append(b);
   }
-  root.append(grid, el("p", { className: "hint", textContent: CONSTRAINTS.find((c) => c.kind === d.conKind)!.hint }));
-  if (!d.constraints.length) return;
-  root.append(el("h3", { textContent: `Связи (${d.constraints.length})` }));
+  root.append(grid);
+  if (d.tool === "constraint") root.append(el("p", { className: "hint", textContent: CONSTRAINTS.find((c) => c.kind === d.conKind)!.hint }));
+  else root.append(el("p", { className: "hint", textContent: "Выберите тип связи и коснитесь элементов эскиза." }));
   d.constraints.forEach((c, k) => {
     const def = CONSTRAINTS.find((x) => x.kind === c.kind)!;
+    if (def.dim) return; // размеры — в своём разделе
     const del = el("button", { textContent: "✕", title: "Удалить связь" });
     del.addEventListener("click", () => {
       keepStep(d);
@@ -2606,7 +2610,6 @@ function renderConstraintSection(root: HTMLElement, d: Draft) {
 function renderDimSection(root: HTMLElement, d: Draft) {
   const list = d.constraints.map((c, k) => ({ c, k })).filter(({ c }) => ["length", "diameter", "angle", "distance"].includes(c.kind));
   if (!list.length) return;
-  root.append(el("h3", { textContent: `Размеры (${list.length})` }));
   for (const { c, k } of list) {
     const del = el("button", { textContent: "✕", title: "Удалить размер" });
     del.addEventListener("click", () => {
@@ -2624,15 +2627,28 @@ function renderDimSection(root: HTMLElement, d: Draft) {
   }
 }
 
+/** Сворачиваемый раздел панели; открыт/закрыт — запоминается */
+function section(id: string, title: string, defaultOpen: boolean, ...children: (Node | null | false)[]): HTMLDetailsElement {
+  const saved = getPref(`sect:${id}`);
+  const det = el("details", { className: "sect" }) as HTMLDetailsElement;
+  det.open = saved ? saved === "1" : defaultOpen;
+  det.append(el("summary", { textContent: title }), ...(children.filter(Boolean) as Node[]));
+  det.addEventListener("toggle", () => setPref(`sect:${id}`, det.open ? "1" : "0"));
+  return det;
+}
+
 function renderSketchPanel(root: HTMLElement) {
   const d = draft!;
+  // «Готово» и «Отмена» — всегда наверху, не прокручиваются
+  root.append(el("div", { className: "sticky-actions" }, buttonRow(["✓ Готово", finishSketch, "primary"], ["Отмена", cancelSketch])));
   const tools = el("div", { className: "tools" });
   for (const t of TOOLS) {
     const b = el("button", { className: d.tool === t.id ? "on" : "", title: t.label }, el("span", { className: "ico", textContent: t.ico }), t.label);
     b.addEventListener("click", () => setTool(t.id));
     tools.append(b);
   }
-  root.append(el("h3", { textContent: "Эскиз" }), tools, el("p", { className: "hint", textContent: TOOLS.find((t) => t.id === d.tool)!.hint }));
+  const toolsBox = el("div");
+  toolsBox.append(tools, el("p", { className: "hint", textContent: TOOLS.find((t) => t.id === d.tool)!.hint }));
   const orthoBtn = el("button", { className: d.ortho ? "on" : "", textContent: "⊾ Орто", title: "Ортогональный режим (O): отрезки строго по горизонтали/вертикали" });
   orthoBtn.addEventListener("click", () => toggleOrtho());
   const autoBtn = el("button", {
@@ -2646,11 +2662,21 @@ function renderSketchPanel(root: HTMLElement) {
     toast(d.autoCon ? "Авто-связи включены" : "Авто-связи выключены");
     renderProps();
   });
-  root.append(el("div", { className: "row" }, orthoBtn, autoBtn));
-  if (d.tool === "line") root.append(buttonRow(["Замкнуть", closePoly], ["↶ Шаг назад", stepBack]));
-  else root.append(buttonRow(["↶ Шаг назад", stepBack]));
-  if (d.tool === "dim" && d.refDims.length) {
-    root.append(
+  toolsBox.append(el("div", { className: "row" }, orthoBtn, autoBtn));
+  if (d.tool === "line") toolsBox.append(buttonRow(["Замкнуть", closePoly], ["↶ Шаг назад", stepBack]));
+  else toolsBox.append(buttonRow(["↶ Шаг назад", stepBack]));
+  if (d.tool === "select" && d.sel && d.profiles[d.sel.i]) renderPointSection(toolsBox, d);
+  root.append(section("sk-tools", "Инструменты", true, toolsBox));
+  // Связи и размеры — отдельные разделы, видны при любом инструменте
+  const conBox = el("div");
+  renderConstraintSection(conBox, d);
+  const nCon = d.constraints.filter((c) => !CONSTRAINTS.find((x) => x.kind === c.kind)?.dim).length;
+  root.append(section("sk-cons", `Связи (${nCon})`, true, conBox));
+  const dimBox = el("div");
+  renderDimSection(dimBox, d);
+  const nDim = d.constraints.filter((c) => CONSTRAINTS.find((x) => x.kind === c.kind)?.dim).length + d.refDims.length;
+  if (d.refDims.length) {
+    dimBox.append(
       buttonRow([
         `Убрать размеры до граней (${d.refDims.length})`,
         () => {
@@ -2662,11 +2688,10 @@ function renderSketchPanel(root: HTMLElement) {
       ]),
     );
   }
-  if (d.tool === "select" && d.sel && d.profiles[d.sel.i]) renderPointSection(root, d);
-  if (d.tool === "constraint") renderConstraintSection(root, d);
-  if (d.tool === "dim") renderDimSection(root, d);
+  if (!dimBox.childNodes.length) dimBox.append(el("p", { className: "hint", textContent: "Размеров нет. Инструмент «Размер»: касание отрезка — длина, двух отрезков — угол или расстояние." }));
+  root.append(section("sk-dims", `Размеры (${nDim})`, nDim > 0, dimBox));
 
-  root.append(el("h3", { textContent: `Профили (${d.profiles.length})` }));
+  const profBox = el("div");
   d.profiles.forEach((p, i) => {
     const del = el("button", { textContent: "✕", title: "Удалить" });
     del.addEventListener("click", () => {
@@ -2684,10 +2709,10 @@ function renderSketchPanel(root: HTMLElement) {
         drawDraft();
       }),
     );
-    root.append(box);
+    profBox.append(box);
   });
-  if (!d.profiles.length) root.append(el("p", { className: "hint", textContent: "Нарисуйте контур пальцем или стилусом. Два пальца — сдвиг и масштаб вида." }));
-  root.append(buttonRow(["Готово", finishSketch, "primary"], ["Отмена", cancelSketch]));
+  if (!d.profiles.length) profBox.append(el("p", { className: "hint", textContent: "Нарисуйте контур пальцем или стилусом. Два пальца — сдвиг и масштаб вида." }));
+  root.append(section("sk-profiles", `Фигуры (${d.profiles.length})`, false, profBox));
 }
 
 function renderExtrudePanel(root: HTMLElement, sk: Sketch, prof: Profile) {
@@ -2758,18 +2783,6 @@ function renderExtrudePanel(root: HTMLElement, sk: Sketch, prof: Profile) {
   opBox = el("div", { className: "op" });
   root.append(opBox);
   root.append(buttonRow(["Вытянуть", applyExtrude, "primary"]));
-  if (prof.kind === "region")
-    root.append(
-      el("p", { className: "hint", textContent: `Выбрано областей: ${selProfile?.regions?.length ?? 1}. Касайтесь других областей эскиза, чтобы добавить или убрать их.` }),
-      buttonRow(["Изменить эскиз", () => startSketch(sk.plane, sk.hostBodyId, sk)]),
-    );
-  else
-    root.append(
-      buttonRow(
-        ["Изменить эскиз", () => startSketch(sk.plane, sk.hostBodyId, sk)],
-        ["Удалить", () => deleteProfile(selProfile!)],
-      ),
-    );
 }
 
 function renderRevolvePanel(root: HTMLElement, sk: Sketch, prof: Profile) {
@@ -2877,10 +2890,24 @@ function renderProps() {
   const root = $("#props");
   root.innerHTML = "";
   distInput = opBox = null;
+  if (mode !== "normal") renderOpPanel(null);
   if (mode === "pickPlane") return renderPickPlane(root);
   if (mode === "sketch") return renderSketchPanel(root);
   const ctx = extrudeCtx();
-  if (ctx) return renderExtrudePanel(root, ctx.sk, ctx.prof);
+  renderOpPanel(ctx);
+  if (ctx) {
+    root.append(
+      el("h3", { textContent: `${PROFILE_NAMES[ctx.prof.kind]} — эскиз «${ctx.sk.name}»` }),
+      el("p", { className: "hint", textContent: isClosed(ctx.prof) ? "Вытягивание и вращение — на панели над моделью. Тяните стрелку или введите число." : "Этот элемент не замкнут — его нельзя вытянуть." }),
+    );
+    if (ctx.prof.kind === "region")
+      root.append(
+        el("p", { className: "hint", textContent: `Выбрано областей: ${selProfile?.regions?.length ?? 1}. Касайтесь других областей эскиза, чтобы добавить или убрать их.` }),
+        buttonRow(["Изменить эскиз", () => startSketch(ctx.sk.plane, ctx.sk.hostBodyId, ctx.sk)]),
+      );
+    else root.append(buttonRow(["Изменить эскиз", () => startSketch(ctx.sk.plane, ctx.sk.hostBodyId, ctx.sk)], ["Удалить", () => deleteProfile(selProfile!)]));
+    return;
+  }
   if (mode === "plane") return renderPlaneTool(root);
   if (mode === "pickAxis") {
     root.append(
@@ -2898,6 +2925,35 @@ function renderProps() {
   if (sel.length === 1) return renderBodyPanel(root, sel[0]);
   if (sel.length > 1) return renderMultiPanel(root, sel);
   root.innerHTML = `<h3>Подсказки</h3><p class="hint">${PICK_HINTS[pickMode]}<br><br>«Эскиз» — нарисовать контур на плоскости или грани, затем вытянуть его.<br><br>Перо — выбор и рисование.<br>Один палец — вращать вид (вокруг точки под пальцем).<br>Два пальца — масштаб и сдвиг.<br>Касание двумя пальцами — отменить, тремя — повторить.</p>`;
+}
+
+/** Панель операции над моделью: вытягивание/вращение выбранного профиля */
+let opPanelKey = "";
+function renderOpPanel(ctx: ReturnType<typeof extrudeCtx>) {
+  const box = $("#op-panel");
+  if (!ctx) {
+    box.style.display = "none";
+    box.replaceChildren();
+    opPanelKey = "";
+    return;
+  }
+  // Поле, в котором сейчас вводят число, не пересоздаём — иначе пропадает клавиатура
+  if (box.contains(document.activeElement) && document.activeElement instanceof HTMLInputElement) {
+    distInput = box.querySelector<HTMLInputElement>(".field input");
+    opBox = box.querySelector<HTMLElement>(".op");
+    return;
+  }
+  const key = `${ctx.sk.id}:${selProfile?.index}:${selProfile?.regions?.join(",")}`;
+  box.replaceChildren();
+  renderExtrudePanel(box, ctx.sk, ctx.prof);
+  box.style.display = "";
+  // Появление — с анимацией, только когда выбран другой профиль
+  if (key !== opPanelKey) {
+    box.classList.remove("enter");
+    void box.offsetWidth;
+    box.classList.add("enter");
+  }
+  opPanelKey = key;
 }
 
 function renderLockedPanel(root: HTMLElement, b: Body) {
@@ -3022,6 +3078,8 @@ function rowMenuButton(items: () => [string, () => void, string?][]) {
 }
 
 function renderTree() {
+  const n = doc.bodies.length + doc.sketches.length + doc.planes.length;
+  $("#tree-count").textContent = n ? `(${n})` : "";
   const ul = $("#body-list");
   ul.innerHTML = "";
   if (!doc.bodies.length) ul.append(el("li", { className: "empty", textContent: "Пусто — создайте тело или эскиз" }));
@@ -3538,6 +3596,12 @@ renderToolbar();
 applySnap(getPref("snap") !== "0");
 if (getPref("projection") === "ortho") view.setProjection("ortho");
 if (getPref("timeline") === "1") setTimelineOpen(true);
+// Перечень объектов по умолчанию свёрнут; открытие запоминается
+{
+  const tree = $<HTMLDetailsElement>("#tree");
+  tree.open = getPref("sect:tree") === "1";
+  tree.addEventListener("toggle", () => setPref("sect:tree", tree.open ? "1" : "0"));
+}
 
 // ---------- проекты ----------
 const LAST_KEY = "tabcad:lastProject";

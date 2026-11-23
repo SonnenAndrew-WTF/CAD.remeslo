@@ -263,6 +263,8 @@ export class Viewport {
   private cubeMatrix = "";
   private projBtn: HTMLButtonElement;
   private anim: { from: THREE.Vector3; q: THREE.Quaternion; t0: number; dist: number } | null = null;
+  /** Плавный перелёт камеры (показать всё, вход в эскиз) */
+  private fly: { t0: number; ms: number; t: [THREE.Vector3, THREE.Vector3]; p: [THREE.Vector3, THREE.Vector3]; z: [number, number] } | null = null;
 
   constructor(private container: HTMLElement) {
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -307,7 +309,10 @@ export class Viewport {
     this.orbit.target.set(0, 0, 20);
     // Масштаб колесом/щипком — к точке под курсором, а не к центру экрана
     this.orbit.zoomToCursor = true;
-    this.orbit.addEventListener("start", () => (this.anim = null));
+    this.orbit.addEventListener("start", () => {
+      this.anim = null;
+      this.fly = null;
+    });
 
     this.gizmo = new TransformControls(this.camera, this.renderer.domElement);
     this.gizmo.setMode("translate");
@@ -550,12 +555,34 @@ export class Viewport {
     // Взгляд строго вдоль оси Z вырожден для камеры с up = Z — чуть наклоняем
     if (Math.abs(to.z) > 0.999) to.y -= Math.sign(to.z) * 1e-3;
     to.normalize();
+    this.fly = null;
     const offset = this.camera.position.clone().sub(this.orbit.target);
     const from = offset.clone().normalize();
     this.anim = { from, q: new THREE.Quaternion().setFromUnitVectors(from, to), t0: performance.now(), dist: offset.length() };
   }
 
+  /** Перелететь камерой к цели и позиции (и масштабу орто-камеры) с замедлением в конце */
+  private flyTo(target: THREE.Vector3, position: THREE.Vector3, zoom = this.ortho.zoom, ms = 380) {
+    this.anim = null;
+    this.fly = { t0: performance.now(), ms, t: [this.orbit.target.clone(), target.clone()], p: [this.camera.position.clone(), position.clone()], z: [this.ortho.zoom, zoom] };
+  }
+
+  private stepFly() {
+    const f = this.fly;
+    if (!f) return;
+    const t = Math.min(1, (performance.now() - f.t0) / f.ms);
+    const k = 1 - Math.pow(1 - t, 3);
+    this.orbit.target.lerpVectors(f.t[0], f.t[1], k);
+    this.camera.position.lerpVectors(f.p[0], f.p[1], k);
+    if (this.camera === this.ortho && f.z[0] !== f.z[1]) {
+      this.ortho.zoom = f.z[0] + (f.z[1] - f.z[0]) * k;
+      this.ortho.updateProjectionMatrix();
+    }
+    if (t >= 1) this.fly = null;
+  }
+
   private stepAnimation() {
+    this.stepFly();
     const a = this.anim;
     if (!a) return;
     const t = Math.min(1, (performance.now() - a.t0) / VIEW_ANIM_MS);
@@ -1194,12 +1221,8 @@ export class Viewport {
     const sphere = box.getBoundingSphere(new THREE.Sphere());
     const dir = this.camera.position.clone().sub(this.orbit.target).normalize();
     const dist = (sphere.radius / Math.sin(THREE.MathUtils.degToRad(this.persp.fov / 2))) * 1.15;
-    this.orbit.target.copy(sphere.center);
-    this.camera.position.copy(sphere.center).addScaledVector(dir, dist);
-    if (this.camera === this.ortho) {
-      this.ortho.zoom = (this.ortho.top - this.ortho.bottom) / (2 * sphere.radius * 1.15);
-      this.ortho.updateProjectionMatrix();
-    }
+    const zoom = this.camera === this.ortho ? (this.ortho.top - this.ortho.bottom) / (2 * sphere.radius * 1.15) : this.ortho.zoom;
+    this.flyTo(sphere.center, sphere.center.clone().addScaledVector(dir, dist), zoom);
   }
 
   // ---------- режим эскиза ----------
@@ -1238,8 +1261,8 @@ export class Viewport {
     // убирает вырожденный случай «взгляд параллелен оси up» для горизонтальных плоскостей
     const dist = Math.max(this.camera.position.distanceTo(this.orbit.target), 150);
     const o = v3(pl.origin);
-    this.orbit.target.copy(o);
-    this.camera.position.copy(o).addScaledVector(v3(pl.normal), dist).addScaledVector(v3(pl.yDir), -dist * 1e-3);
+    // Камера плавно разворачивается к плоскости эскиза
+    this.flyTo(o, o.clone().addScaledVector(v3(pl.normal), dist).addScaledVector(v3(pl.yDir), -dist * 1e-3));
     // Общая сетка в плоскости XY совпала бы с сеткой эскиза со сдвигом — получалась «двойная» сетка
     this.grid.visible = false;
     this.buildSketchGrid(pl);

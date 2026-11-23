@@ -654,3 +654,54 @@ button.primary.danger { background: var(--danger); }
 button { transition: transform .12s ease, box-shadow .12s ease, filter .12s ease; }
 button:not(:disabled):active,
 button.pressed:not(:disabled) { transform: scale(0.94); box-shadow: var(--pressed-sm); filter: brightness(0.95); }
+
+/* ---------- разделы панели ---------- */
+details.sect { margin: 10px 0; border-radius: var(--r-md); box-shadow: var(--raised-sm); padding: 0 12px; }
+details.sect > summary {
+  list-style: none; cursor: pointer; user-select: none;
+  display: flex; align-items: center; gap: 8px;
+  min-height: 44px;
+  font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); font-weight: 600;
+}
+details.sect > summary::-webkit-details-marker { display: none; }
+details.sect > summary::after { content: "›"; margin-left: auto; font-size: 20px; transition: transform .2s ease; }
+details.sect[open] > summary::after { transform: rotate(90deg); }
+details.sect[open] > summary { color: var(--text); }
+details.sect[open] { padding-bottom: 12px; }
+details.sect[open] > :not(summary) { animation: sect-in .22s ease; }
+@keyframes sect-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+#tree .count { font-weight: 400; }
+#app.sketching #tree { display: none; }
+
+/* «Готово» в эскизе — закреплено вверху панели */
+.sticky-actions { position: sticky; top: -14px; z-index: 2; margin: -14px -14px 6px; padding: 14px 14px 8px; background: var(--bg); }
+.sticky-actions .row { margin-top: 0; }
+
+/* Смена содержимого панели — мягкое появление */
+#props > * { animation: props-in .18s ease; }
+@keyframes props-in { from { opacity: .4; } to { opacity: 1; } }
+
+/* ---------- панель операции над моделью ---------- */
+#op-panel {
+  position: absolute; top: 12px; left: 12px; right: 150px;
+  z-index: 4;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
+  padding: 10px 14px;
+  border-radius: var(--r-md);
+  background: var(--bg);
+  box-shadow: var(--raised);
+  max-height: 45%;
+  overflow-y: auto;
+}
+#op-panel.enter { animation: op-in .25s cubic-bezier(.2,.8,.3,1); }
+@keyframes op-in { from { opacity: 0; transform: translateY(-14px); } to { opacity: 1; transform: none; } }
+#op-panel h3 { display: none; }
+#op-panel .hint { display: none; }
+#op-panel .segmented { margin: 0; min-width: 240px; }
+#op-panel .field { margin: 0; grid-template-columns: auto 96px; }
+#op-panel .row { margin: 0; }
+#op-panel .row button { min-width: 110px; }
+#op-panel .op { margin: 0; padding: 6px 10px; }
+#op-panel .row button { height: 40px; }
+#op-panel .segmented button { height: 32px; }
+@media (max-width: 900px) { #op-panel { right: 12px; top: 150px; } }

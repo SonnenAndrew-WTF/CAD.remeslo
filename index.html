@@ -50,18 +50,20 @@
           <p>Эскиз рисуется пером на плоскости, потом вытягивается в тело.</p>
         </div>
         <div id="timeline" style="display: none"></div>
+        <div id="op-panel" style="display: none"></div>
       </main>
 
       <aside id="panel">
-        <section id="tree">
+        <section id="props"></section>
+        <details id="tree" class="sect">
+          <summary>Объекты <span id="tree-count" class="count"></span></summary>
           <h3>Тела</h3>
           <ul id="body-list"></ul>
           <h3 id="sketch-head">Эскизы</h3>
           <ul id="sketch-list"></ul>
           <h3 id="plane-head">Плоскости</h3>
           <ul id="plane-list"></ul>
-        </section>
-        <section id="props"></section>
+        </details>
       </aside>
     </div>
 
